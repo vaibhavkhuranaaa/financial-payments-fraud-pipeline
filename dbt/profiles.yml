@@ -1,0 +1,9 @@
+# Local/CI profile: DuckDB file target, hermetic (no external services).
+# `dbt build --profiles-dir .` (run from dbt/) picks this up directly.
+fraud_analytics:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: fraud.duckdb
+      threads: 4

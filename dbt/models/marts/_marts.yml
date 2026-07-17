@@ -1,0 +1,44 @@
+version: 2
+
+models:
+  - name: fct_daily_fraud_rate
+    description: One row per calendar date — transaction volume, fraud count/rate, gross settled amount.
+    columns:
+      - name: txn_date
+        tests:
+          - not_null
+          - unique
+      - name: fraud_rate
+        tests:
+          - not_null
+          - fraud_rate_between_0_and_1
+
+  - name: fct_merchant_risk
+    description: One row per (mcc_group, merchant_state) — volume, fraud rate, avg amount.
+    columns:
+      - name: mcc_group
+        tests:
+          - not_null
+      - name: fraud_rate
+        tests:
+          - not_null
+          - fraud_rate_between_0_and_1
+
+  - name: fct_channel_mix
+    description: One row per channel (chip/swipe/online) — volume, fraud rate, cross-border share.
+    columns:
+      - name: channel
+        tests:
+          - not_null
+          - unique
+          - accepted_values:
+              arguments:
+                values: ["chip", "swipe", "online"]
+      - name: fraud_rate
+        tests:
+          - not_null
+          - fraud_rate_between_0_and_1
+      - name: cross_border_share
+        tests:
+          - not_null
+          - fraud_rate_between_0_and_1

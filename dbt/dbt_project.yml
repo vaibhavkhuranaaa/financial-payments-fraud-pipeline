@@ -1,0 +1,26 @@
+name: "fraud_analytics"
+version: "1.0.0"
+config-version: 2
+
+profile: "fraud_analytics"
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+clean-targets: ["target", "dbt_packages"]
+
+vars:
+  # Mirrors src/pipeline/ingestion.py TOKENIZATION_SALT / .env.example default.
+  # Overridden with --vars '{tokenization_salt: ...}' if a non-default salt is
+  # ever used to produce the sample CSV's source events.
+  tokenization_salt: "change-me-local-only"
+  # Path is relative to `dbt/` (dbt build is always invoked from this directory
+  # per docs/tickets/04-analytics-docs.md), so CI/local runs resolve identically.
+  sample_csv_path: "../data/sample/transactions_sample.csv"
+
+models:
+  fraud_analytics:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

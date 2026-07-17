@@ -1,0 +1,53 @@
+version: 2
+
+models:
+  - name: stg_transactions
+    description: >
+      Analytical mirror of contracts/transaction.schema.json (data contract
+      v1). One row per raw TabFormer CSV row from data/sample/transactions_sample.csv,
+      mapped through the same rules as src/pipeline/ingestion.py::to_event()
+      (card tokenization, channel rename, amount parsing, merchant_state/
+      merchant_country derivation, Yes/No -> boolean is_fraud). See the model
+      SQL header comment and docs/governance/lineage.md for how this relates
+      to the live streaming path.
+    columns:
+      - name: event_id
+        description: Row-sequence surrogate key (source CSV has no natural event id; the live producer mints a uuid4 per event instead).
+        tests:
+          - not_null
+          - unique
+      - name: card_token
+        description: Salted SHA-256 token of `user_id:card_id` — never the raw PAN/card identifier.
+        tests:
+          - not_null
+      - name: user_id
+        tests:
+          - not_null
+      - name: event_time
+        description: Transaction timestamp (UTC), reconstructed from the source Year/Month/Day/Time columns.
+        tests:
+          - not_null
+      - name: amount
+        tests:
+          - not_null
+      - name: channel
+        description: Card-present (chip/swipe) vs card-not-present (online).
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["chip", "swipe", "online"]
+      - name: merchant_country
+        tests:
+          - not_null
+      - name: mcc
+        tests:
+          - not_null
+      - name: is_fraud
+        description: >
+          Ground-truth label mapped from the source Yes/No column. not_null is
+          load-bearing: a mapping regression (e.g. type-sniffed booleans vs
+          'Yes'/'No' strings) NULLs every row and silently zeroes fraud in all
+          downstream marts.
+        tests:
+          - not_null

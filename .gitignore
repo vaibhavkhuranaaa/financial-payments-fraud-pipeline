@@ -19,10 +19,11 @@ data/*
 !.env.example
 
 # Artifacts
-models/
+/models/
 data/delta/
 *.duckdb
 dbt/target/
 dbt/logs/
 .terraform/
 *.tfstate*
+*.user.yml

@@ -1,36 +1,125 @@
-# [Project Name]
+# Financial Payments Fraud Pipeline
 
-[One-sentence description of what this does and why it matters, framed around the real-world use case — not the algorithm.]
+A streaming, orchestrated fraud-detection pipeline over IBM's TabFormer synthetic credit-card transactions: contract-validated Kafka ingestion, Spark Structured Streaming windowed feature engineering with an online (Redis) / offline (Delta Lake) split, an XGBoost fraud classifier, and a latency-measured Flask scoring API — deployed to Azure Container Apps via Terraform. Built to demonstrate real streaming data-engineering discipline (schemas, train/serve-skew prevention, measured latency, IaC, teardown), not a static notebook.
 
 ## Problem
-[What operational/business problem does this solve? Who would actually use this?]
+Card-issuer fraud teams need a decision — approve or hold for review — in milliseconds, at the moment of authorization, using only what's known about a card's recent behavior plus the transaction itself. That means the hard part isn't the model; it's the pipeline: validating events at the door, computing point-in-time-correct behavioral features (a card's transaction velocity, spend, and decline pattern over the last minute/10 minutes/hour) without ever leaking the future into a feature, keeping the exact same feature logic online (serving) and offline (training), and serving a score under a tight latency budget. This project builds that pipeline end-to-end.
 
 ## Data
-- **Source:** [dataset name + where it comes from]
-- **Access:** [open / requires credentialing — link to how]
-- **Size/shape:** [rows, time range, entities — whatever orients the reader]
+- **Source:** [IBM TabFormer](https://github.com/IBM/TabFormer) — large-scale (24M+ row) realistic *synthetic* credit-card transaction data, released by IBM for fraud-detection research. No real cardholders, no real PANs.
+- **Access:** open, no credentialing needed; distributed via Git LFS. Run `python scripts/get_data.py --all` to download the full archive to `data/raw/` (git-ignored, ~2.3GB extracted) and carve the committed local-dev sample.
+- **Size/shape:** full dataset is ~24M transactions, 2010–2019, ~2,000 synthetic users/cards. The committed sample, `data/sample/transactions_sample.csv` (76,989 rows / 7.1MB), is carved at the *user* level — 100 users' full transaction sequences kept intact (required for realistic windowed features), biased toward fraud-affected users, seed=42 for reproducibility.
 
 ## Architecture
-[Diagram — even a simple one made in draw.io/excalidraw exported as PNG, or an ASCII/mermaid diagram. Show data flow: source → processing → model → API → deployment.]
+
+```mermaid
+flowchart LR
+    A[TabFormer CSV] --> B["ingestion.py\nvalidate + tokenize"]
+    B --> C[["transactions"\nRedpanda / Event Hubs]]
+    B -. invalid .-> C_DLQ[["transactions.dlq"]]
+    C --> D["features.py\nSpark Structured Streaming\nre-validate + enrich"]
+    D -. invalid .-> DQ[(Delta _quarantine)]
+    D --> E[Windowed aggregates\n1m / 10m / 1h per card]
+    E --> F[(Redis\nonline features)]
+    D --> G[(Delta events)]
+    E --> H[(Delta card_features)]
+    G --> I["train.py\nXGBoost"]
+    H --> I
+    I --> M[models/model.json\n+ threshold.json]
+    M --> J["app.py\nFlask /score"]
+    F --> J
+    A -.same contract, hand-mirrored mapping.-> K["dbt (DuckDB)\nstg_transactions"]
+    K --> L[fct_daily_fraud_rate]
+    K --> N[fct_merchant_risk]
+    K --> O[fct_channel_mix]
+```
+
+Full lineage detail (including the DLQ/quarantine dead-letter paths and exactly which module owns which mapping) is in [`docs/governance/lineage.md`](docs/governance/lineage.md). Field-level definitions are in [`docs/governance/data-dictionary.md`](docs/governance/data-dictionary.md). The data contract itself is [`contracts/transaction.schema.json`](contracts/transaction.schema.json). Key architecture decisions and their rationale are in [`docs/adr/0001-stack-and-architecture.md`](docs/adr/0001-stack-and-architecture.md).
 
 ## Key Results
-[The metrics that matter for this problem — not just accuracy. E.g. for fraud: precision/recall at a chosen threshold, latency. For healthcare: AUROC + calibration + a SHAP example. Be specific and honest, including failure modes.]
+
+### Model (XGBoost, threshold chosen from the precision-recall curve)
+
+> **A full-data retrain is in flight.** `models/metrics.json` currently reflects a sample-data run whose chronological test split happened to land in a zero-fraud tail of the sample (see that file's `notes` field) — precision/recall/AUC from that run are not representative and are intentionally omitted below pending the full-data retrain.
+
+| Metric | Value |
+|---|---|
+| PR-AUC | `<PENDING METRICS>` |
+| ROC-AUC | `<PENDING METRICS>` |
+| Precision @ threshold | `<PENDING METRICS>` |
+| Recall @ threshold | `<PENDING METRICS>` |
+| Chosen threshold | `<PENDING METRICS>` |
+| Confusion matrix (tn/fp/fn/tp) | `<PENDING METRICS>` |
+
+### API latency (cold-path baseline, local)
+
+Measured with `scripts/benchmark.py` against the local Flask `/score` endpoint, n=500 requests, concurrency=4, **no Redis warm cache** (every card is a cold-start lookup — this is the conservative baseline, not the steady-state number):
+
+| Metric | Value |
+|---|---|
+| Throughput | 1,884 req/s |
+| p50 | 1.87 ms |
+| p95 | 2.25 ms |
+| p99 | 9.90 ms |
+
+A warm-Redis benchmark (representative of steady-state production traffic, where most cards have recent online features already cached) is planned for Phase 5 and will replace/augment this table; until then treat the above as an upper bound on latency, not a lower one.
 
 ## How to Run Locally
+
 ```bash
-git clone https://github.com/<your-username>/<repo-name>.git
-cd <repo-name>
-docker compose up --build
+git clone https://github.com/<your-username>/financial-payments-fraud-pipeline.git
+cd financial-payments-fraud-pipeline
+
+# 1. Get the data (full download + committed sample; sample is already in git)
+python scripts/get_data.py --all   # optional if you only need the committed sample
+
+# 2. Bring up the core stack: Redpanda (Kafka), Redis, Spark streaming job, API
+docker compose -f docker/docker-compose.yml up --build
+
+# 3. In a second terminal, replay the sample CSV onto Kafka (opt-in profile)
+docker compose -f docker/docker-compose.yml --profile replay up producer
+
+# 4. Score a transaction
+curl -X POST http://localhost:8000/score -H 'Content-Type: application/json' -d '{...}'
 ```
-[Any additional setup — env vars, data download steps, etc.]
+
+- Copy `.env.example` to `.env` and adjust (`TOKENIZATION_SALT`, `PRODUCER_EVENTS_PER_SEC`, etc.) before running compose if you need non-default settings.
+- `make check` (lint + tests + dbt build + terraform validate + compose config validate) is the pre-push gate; see `Makefile`/`scripts/check.sh`.
+- To run the analytics layer standalone: `cd dbt && ../.venv/bin/dbt build --profiles-dir .` (builds against the committed sample CSV, no live services required).
 
 ## How to Deploy (Azure)
+
 ```bash
-# [exact commands or reference to infra/ scripts]
+cd infra/terraform
+./deploy.sh      # terraform apply (RG, Event Hubs Standard, ACR, Container Apps env)
+                 # + az acr build (api + pipeline images) + point the Container App at the built image
 ```
 
+Requires `az login` already done and Terraform installed; `deploy.sh` resolves all paths relative to the repo root. Tear down with:
+
+```bash
+cd infra/terraform
+./destroy.sh
+```
+
+Event Hubs **Standard** tier (required for the Kafka-compatible endpoint) is the dominant recurring cost (~$25–30/month while provisioned) — run `destroy.sh` when not actively demoing. See `docs/adr/0001-stack-and-architecture.md` for the full cost/consequence writeup.
+
 ## Tech Stack
-[Bullet list — be specific about versions/services used, this is what gets scanned first]
+- **Language:** Python 3.11 (pinned via `uv`-managed venv — system Python 3.14 is unsupported by PySpark 3.5)
+- **Streaming broker:** Kafka protocol — Redpanda (single container) locally, Azure Event Hubs Standard in the cloud; one client codebase, env-driven SASL config
+- **Stream processing:** Spark Structured Streaming (PySpark 3.5.1)
+- **Storage:** Delta Lake 3.2.0 (offline events/features, ACID + time travel), Redis 7 (online feature store)
+- **Model:** XGBoost 2.1.1 binary classifier, `scale_pos_weight`-adjusted for the ~0.1% fraud base rate, time-based train/valid/test split, threshold selected from the precision-recall curve
+- **Serving:** Flask 3.0.3 + gunicorn, Prometheus metrics (`/metrics`), soft-dependency Redis (never 500s on Redis failure — falls back to `cold_card: true`)
+- **Analytics:** dbt-duckdb 1.8.3 (DuckDB target locally over the sample CSV; models portable to Databricks SQL)
+- **IaC:** Terraform (`azurerm` provider) — Event Hubs, ACR, Log Analytics, Container Apps environment/app; `terraform destroy` tested as part of the Definition of Done
+- **Containerization:** Docker (`docker/docker-compose.yml` for local dev, separate `Dockerfile.api` / `Dockerfile.pipeline` images), Azure Container Apps for cloud deployment
+- **Governance:** JSON-Schema data contract (`contracts/`), producer + in-stream re-validation with DLQ/quarantine dead-letter paths, salted-SHA-256 PAN tokenization, dbt tests as quality gates, data-dictionary/lineage/tokenization-policy docs (`docs/governance/`)
 
 ## What I'd Improve Next
-[This section matters — shows you understand the limits of your own work. Be specific: what's the biggest gap, what would production-hardening actually require, what didn't you have time/data for.]
+- **Full-data model metrics.** The committed `models/metrics.json` is from a sample run whose chronological split happened to skew all fraud into the training fold — the retrain on the full ~24M-row `data/raw/card_transaction.v1.csv` (in flight) is what should actually back the Key Results table above.
+- **Warm-Redis latency benchmark.** The only latency number in this README today is the cold-path (every card missing from Redis) baseline — the number that actually matters for production capacity planning is steady-state, with realistic Redis hit rates.
+- **dbt-over-DuckDB vs. a real warehouse.** The dbt project reads the sample CSV directly (via DuckDB's `read_csv_auto`), and `stg_transactions.sql` hand-mirrors `ingestion.py::to_event()`'s mapping logic in SQL rather than sharing one implementation — SQL can't import the Python module, so the two can drift if one changes without the other. On Databricks SQL, this staging model would instead read the same Delta tables the streaming job already writes, eliminating the duplication entirely.
+- **Single-node streaming.** Redpanda and the Spark job both run as single instances locally; there's no tested failover/rebalance story, and Spark's `foreachBatch` Redis writes are not currently idempotent under retry (a replayed microbatch after a crash could double-count a window's contribution if the same batch is retried non-atomically).
+- **Synthetic data ceiling.** TabFormer is realistic but synthetic — fraud patterns, MCC distributions, and cross-border behavior are generator artifacts, not real adversarial behavior; a production model would need real (or at minimum adversarially-validated) data before any deployment decision.
+- **No feature drift/monitoring.** There's no automated check that the Redis-served features and the Delta/offline features stay in agreement in production (the train/serve-skew *prevention* mechanism — one shared `features.py` module — exists, but there's no *detection* mechanism for the day it silently breaks anyway, e.g. a stale Redis hash after a schema change).
