@@ -33,6 +33,7 @@ Full plan: `~/.claude/plans/review-the-repository-plan-frolicking-gem.md` (local
 - **Detached full retrain running:** `/usr/bin/time -l .venv/bin/python -m src.pipeline.train --input data/raw/card_transaction.v1.csv --since-year 2013 --until-year 2019` → log `/tmp/train_run_logs/full_run_v2.log` (ends with `EXIT_CODE=`). Overwrites `models/*` (gitignored) on completion. v1 full-run reference: PR-AUC 0.0029 / ROC-AUC 0.65 / 116s / 5.6GB RSS.
 
 ## Next step (exact resume sequence)
+0. Strip AI co-author trailers from ALL local commits (main + wip branch) before any push: `git filter-branch --msg-filter 'sed "/Co-Authored-By: Claude/d"' -- --all`; verify `git log --all --grep=Claude` is empty. No trailers on future commits.
 1. Check `/tmp/train_run_logs/full_run_v2.log` + `models/metrics.json` (trained_at must be AFTER 2026-07-17T09:03Z; if the run died, rerun the command above from the branch).
 2. On `wip/model-iteration-v2`: fix `src/app.py` feature building for the v2 columns (Redis hash now also carries `last_event_ts`; keep derivation in shared features.py per ticket-01 skew rule), make the 5 API tests green.
 3. If v2 metrics are sane (PR-AUC should beat 0.0029 by a lot; check precision@top-0.1%): merge branch to main, fill README `<PENDING METRICS>` (lines ~47–52) + update README/lineage diagrams (still say 1m/10m/1h), refresh dbt window references if any.
