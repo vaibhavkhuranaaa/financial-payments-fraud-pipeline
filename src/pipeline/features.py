@@ -48,9 +48,13 @@ import os
 import sys
 from collections import Counter, deque
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
+
+if TYPE_CHECKING:
+    import numpy as np
+    import pandas as pd
 
 load_dotenv()
 
@@ -256,6 +260,186 @@ def build_feature_row(event: dict[str, Any], window_features: dict[str, float]) 
     row["day_of_week"] = enriched["day_of_week"]
     row.update(window_features)
     return row
+
+
+def enrich_vectorized(
+    channel: "pd.Series",
+    merchant_country: "pd.Series",
+    amount: "pd.Series",
+    mcc: "pd.Series",
+    event_time: "pd.Series",
+) -> "pd.DataFrame":
+    """Vectorized equivalent of `enrich()` applied to whole columns at once.
+
+    Same semantics as the per-event function (is_cnp, is_cross_border,
+    mcc_group_id, amount_log, hour_of_day, day_of_week) — used by the
+    fast/vectorized training path so 24M rows don't pay per-row Python
+    function-call overhead.
+    """
+    import numpy as np
+    import pandas as pd
+
+    is_cnp = (channel == "online").astype("int64")
+    is_cross_border = (~merchant_country.isin(["US", "XX"])).astype("int64")
+
+    exact_group = mcc.map(_MCC_EXACT_GROUPS)
+    is_travel_range = mcc.between(3000, 3999)
+    mcc_group = exact_group.where(exact_group.notna(), np.where(is_travel_range, "travel", "other"))
+    mcc_group_id = mcc_group.map(MCC_GROUP_IDS).astype("int64")
+
+    amount_log = np.log1p(amount.abs())
+
+    event_dt = pd.to_datetime(event_time, utc=True)
+    hour_of_day = event_dt.dt.hour.astype("int64")
+    day_of_week = event_dt.dt.dayofweek.astype("int64")
+
+    return pd.DataFrame(
+        {
+            "is_cnp": is_cnp,
+            "is_cross_border": is_cross_border,
+            "mcc_group_id": mcc_group_id,
+            "amount_log": amount_log,
+            "hour_of_day": hour_of_day,
+            "day_of_week": day_of_week,
+        },
+        index=channel.index,
+    )
+
+
+def _distinct_count_in_expanding_ranges(city_codes: "np.ndarray", left: "np.ndarray") -> "np.ndarray":
+    """For a single card's events (already time-sorted), return, for each
+    position i, the number of DISTINCT city codes in the half-open range
+    [left[i], i) — i.e. strictly-before-i history, windowed by `left`.
+
+    `left` (the window's start index per position) must be non-decreasing,
+    which holds here because it is derived from a monotonic time cutoff
+    (searchsorted over a sorted array). Under that guarantee, both window
+    endpoints only move forward as i increases, so a two-pointer sweep visits
+    each position O(1) amortized times total — no per-event dict/object
+    allocation, just a small int->int frequency map over city codes.
+    """
+    n = len(city_codes)
+    out = [0] * n
+    freq: dict[int, int] = {}
+    distinct = 0
+    lo = 0
+    hi = 0  # elements [0, hi) have been added to the frequency map so far
+    for i in range(n):
+        target_hi = i
+        while hi < target_hi:
+            c = int(city_codes[hi])
+            cnt = freq.get(c, 0) + 1
+            freq[c] = cnt
+            if cnt == 1:
+                distinct += 1
+            hi += 1
+        target_lo = int(left[i])
+        while lo < target_lo:
+            c = int(city_codes[lo])
+            cnt = freq[c] - 1
+            if cnt == 0:
+                del freq[c]
+                distinct -= 1
+            else:
+                freq[c] = cnt
+            lo += 1
+        out[i] = distinct
+    return out
+
+
+def compute_card_features_vectorized(events_df: "pd.DataFrame") -> "pd.DataFrame":
+    """Vectorized, leakage-safe equivalent of `compute_offline_card_features`
+    for the FULL dataset at once (all cards), used by the fast training path.
+
+    Required input columns: card_token, event_time (datetime64, any tz),
+    amount (float), merchant_city (str), has_error (bool).
+
+    Design: count/amount_sum/amount_mean/decline_rate for every CARD_WINDOWS
+    window are pure prefix-sum-over-a-range computations once each card's
+    events are time-ordered (range = [window_start_index(i), i), found per
+    card via `numpy.searchsorted` on that card's sorted epoch-seconds array —
+    no Python loop over rows). Only distinct-city count resists prefix sums
+    (union-of-a-range, not a sum), so it keeps a small O(n) two-pointer loop
+    per card via `_distinct_count_in_expanding_ranges` — but that loop touches
+    plain ints, never per-event dicts/objects, which is what actually made the
+    row-wise reference implementation too slow at 24M-row scale (datetime
+    parsing + dict/Counter[str] construction per event).
+
+    The only genuine Python-level loop here iterates over CARD groups (at
+    most a few thousand for TabFormer), not over rows.
+
+    Returns a DataFrame of window feature columns aligned to `events_df`'s
+    original row order (its index is preserved).
+    """
+    import numpy as np
+    import pandas as pd
+
+    n_total = len(events_df)
+    window_cols = [name for w in CARD_WINDOWS for name in window_feature_names(w)]
+    if n_total == 0:
+        return pd.DataFrame(columns=window_cols, index=events_df.index)
+
+    work = events_df.reset_index(drop=True)
+    seq = np.arange(n_total)
+    card_codes, _ = pd.factorize(work["card_token"].to_numpy(), sort=False)
+    epoch_seconds = work["event_time"].to_numpy("datetime64[ns]").astype("int64") // 1_000_000_000
+    city_codes_all, _ = pd.factorize(work["merchant_city"].fillna("").to_numpy(), sort=False)
+    amounts_all = work["amount"].to_numpy(dtype="float64")
+    has_error_all = work["has_error"].to_numpy(dtype="float64")
+
+    # Sort by (card, time, original row order) — stable tie-break matches the
+    # row-wise reference, which sorts a per-card event list with Python's
+    # stable sort keyed only on event_time (ties preserve input/CSV order).
+    sort_order = np.lexsort((seq, epoch_seconds, card_codes))
+
+    card_sorted = card_codes[sort_order]
+    time_sorted = epoch_seconds[sort_order]
+    amount_sorted = amounts_all[sort_order]
+    error_sorted = has_error_all[sort_order]
+    city_sorted = city_codes_all[sort_order]
+
+    n = len(sort_order)
+    out_cols: dict[str, "np.ndarray"] = {c: np.zeros(n, dtype="float64") for c in window_cols}
+
+    # Group boundaries: card_sorted is contiguous-by-group after the sort above.
+    group_start_positions = np.flatnonzero(np.r_[True, card_sorted[1:] != card_sorted[:-1]])
+    group_end_positions = np.r_[group_start_positions[1:], n]
+
+    amount_prefix_global = np.concatenate(([0.0], np.cumsum(amount_sorted)))
+    error_prefix_global = np.concatenate(([0.0], np.cumsum(error_sorted)))
+
+    for start, end in zip(group_start_positions, group_end_positions, strict=True):
+        times_g = time_sorted[start:end]
+        amount_prefix_g = amount_prefix_global[start : end + 1] - amount_prefix_global[start]
+        error_prefix_g = error_prefix_global[start : end + 1] - error_prefix_global[start]
+        idx = np.arange(len(times_g))
+
+        for window_key, window_seconds in CARD_WINDOWS.items():
+            cutoff = times_g - window_seconds
+            left = np.searchsorted(times_g, cutoff, side="left")
+
+            count = idx - left
+            amount_sum = amount_prefix_g[idx] - amount_prefix_g[left]
+            error_count = error_prefix_g[idx] - error_prefix_g[left]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                amount_mean = np.where(count > 0, amount_sum / np.maximum(count, 1), 0.0)
+                decline_rate = np.where(count > 0, error_count / np.maximum(count, 1), 0.0)
+
+            distinct = _distinct_count_in_expanding_ranges(city_sorted[start:end], left)
+
+            out_cols[f"txn_count_{window_key}"][start:end] = count
+            out_cols[f"amount_sum_{window_key}"][start:end] = amount_sum
+            out_cols[f"amount_mean_{window_key}"][start:end] = amount_mean
+            out_cols[f"distinct_merchant_city_{window_key}"][start:end] = distinct
+            out_cols[f"decline_rate_{window_key}"][start:end] = decline_rate
+
+    # Undo the sort: out_cols are in `sort_order` order; scatter back to the
+    # original row order of `events_df`.
+    result = pd.DataFrame(out_cols)
+    result["_orig_pos"] = sort_order
+    result = result.sort_values("_orig_pos", kind="mergesort").drop(columns="_orig_pos")
+    result.index = events_df.index
+    return result[window_cols]
 
 
 # --- Spark Structured Streaming job (lazy pyspark import; not needed for tests) --

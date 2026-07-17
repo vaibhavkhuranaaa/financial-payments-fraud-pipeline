@@ -7,11 +7,14 @@ start in this environment, per the ticket's test-isolation requirement.
 
 from __future__ import annotations
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from src.pipeline.features import (
     CARD_WINDOWS,
     FEATURE_COLUMNS,
+    MCC_GROUP_IDS,
     build_feature_row,
     compute_offline_card_features,
     enrich,
@@ -59,6 +62,30 @@ def test_enrich_mcc_group() -> None:
     assert enrich(_event(mcc=6011))["mcc_group"] == "cash"  # ATM cash disbursement
     assert enrich(_event(mcc=5964))["mcc_group"] == "online_retail"  # direct marketing
     assert enrich(_event(mcc=1234))["mcc_group"] == "other"
+
+
+def test_enrich_mcc_group_travel_range_boundary() -> None:
+    """The 3000-3999 range rule (airlines/car rental/lodging) in `_mcc_group`
+    has an inclusive boundary on both ends; regressing it would silently
+    change mcc_group_id for those codes with no other test catching it."""
+    assert enrich(_event(mcc=2999))["mcc_group"] == "other"  # just below range
+    assert enrich(_event(mcc=3000))["mcc_group"] == "travel"  # range start
+    assert enrich(_event(mcc=3999))["mcc_group"] == "travel"  # range end
+    assert enrich(_event(mcc=4000))["mcc_group"] == "other"  # just above range
+
+
+def test_mcc_group_id_ordinals_are_stable() -> None:
+    """mcc_group_id is a model-facing ordinal encoding — the numeric ids
+    themselves (not just the group names) are part of the trained model's
+    contract and must not silently shift. Also the values the dbt
+    `mcc_group`/`fct_merchant_risk` mart mirror (docs/governance/lineage.md)."""
+    assert MCC_GROUP_IDS == {
+        "travel": 0,
+        "grocery": 1,
+        "cash": 2,
+        "online_retail": 3,
+        "other": 4,
+    }
 
 
 def test_enrich_amount_log_and_time_parts() -> None:
@@ -182,3 +209,49 @@ def test_event_schema_builds_with_pyspark() -> None:
     assert "card_token" in field_names
     assert "event_time" in field_names
     _ = pyspark
+
+
+def test_vectorized_matches_row_wise_on_sample(tmp_path) -> None:
+    """The 24M-row full-dataset training run needs a vectorized fast path
+    (src.pipeline.train.load_events_vectorized / build_dataset_vectorized)
+    because the row-wise reference path (one Python dict + jsonschema
+    validation per event) is too slow/memory-heavy at that scale. This test
+    is the correctness guarantee for that fast path: on a ~5k-row slice of
+    the committed sample CSV, the vectorized build must produce the exact
+    same labels/order and numerically equal (allclose) feature values as the
+    row-wise reference for every column in FEATURE_COLUMNS.
+    """
+    from src.pipeline.train import (
+        build_dataset,
+        build_dataset_vectorized,
+        load_events,
+        load_events_vectorized,
+    )
+
+    sample_path = "data/sample/transactions_sample.csv"
+    small_csv = tmp_path / "small5k.csv"
+    with open(sample_path, encoding="utf-8") as src:
+        lines = src.readlines()
+    small_csv.write_text("".join(lines[:5001]), encoding="utf-8")  # header + 5000 rows
+
+    salt = "test-salt"
+
+    events, skipped_row = load_events(str(small_csv), salt)
+    df_row = build_dataset(events)
+
+    events_df, skipped_vec = load_events_vectorized(str(small_csv), salt)
+    df_vec = build_dataset_vectorized(events_df)
+
+    assert skipped_row == skipped_vec
+    assert len(df_row) == len(df_vec) == 5000
+
+    # Same event order (both sorted by event_time ascending) and same labels.
+    row_times = pd.to_datetime(df_row["event_time"], utc=True).to_numpy()
+    vec_times = pd.to_datetime(df_vec["event_time"], utc=True).to_numpy()
+    assert (row_times == vec_times).all()
+    assert (df_row["is_fraud"].to_numpy() == df_vec["is_fraud"].to_numpy()).all()
+
+    for col in FEATURE_COLUMNS:
+        row_values = df_row[col].to_numpy(dtype=float)
+        vec_values = df_vec[col].to_numpy(dtype=float)
+        assert np.allclose(row_values, vec_values, atol=1e-6), f"mismatch in column {col}"
