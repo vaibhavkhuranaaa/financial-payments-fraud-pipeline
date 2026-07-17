@@ -3,7 +3,7 @@ FROM python:3.11-slim
 
 # System deps: none beyond base image needed for flask/gunicorn/xgboost/redis wheels.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid 1000 appuser \

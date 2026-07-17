@@ -1,0 +1,80 @@
+# Databricks Asset Bundle for the fraud pipeline (ADR 0001, decision 6).
+#
+# Documentation-grade for v1: this bundle is NOT deployed to a live workspace
+# (cost decision — see ADR 0001). It exists to show the intended Databricks
+# packaging of the same entrypoints that run locally in this repo:
+#   - src/pipeline/features.py --once   (bounded Structured Streaming feature build)
+#   - src/pipeline/train.py             (offline XGBoost training job)
+#
+# To actually deploy: set DATABRICKS_HOST/DATABRICKS_TOKEN, replace the `dev`
+# target's workspace.host placeholder with a real workspace URL, then:
+#   databricks bundle validate
+#   databricks bundle deploy -t dev
+#   databricks bundle run feature_build -t dev
+
+bundle:
+  name: financial-payments-fraud-pipeline
+
+variables:
+  delta_root:
+    description: Root path for Delta tables (events, card_features, _quarantine).
+    default: /mnt/fraud-pipeline/delta
+  input_csv:
+    description: Source CSV for the training job (sample or full TabFormer export).
+    default: /mnt/fraud-pipeline/data/sample/transactions_sample.csv
+
+resources:
+  jobs:
+    feature_build:
+      name: fraud-pipeline-feature-build
+      description: >-
+        Bounded (trigger availableNow) Spark Structured Streaming run: consumes
+        KAFKA_TOPIC_TRANSACTIONS, computes CARD_WINDOWS aggregates via
+        src.pipeline.features, writes Redis online features + Delta
+        events/card_features tables. See src/pipeline/features.py module
+        docstring for the quarantine-table design decision.
+      tasks:
+        - task_key: build_features
+          spark_python_task:
+            python_file: ../src/pipeline/features.py
+            parameters:
+              - "--once"
+          environment_key: fraud_pipeline_env
+      environments:
+        - environment_key: fraud_pipeline_env
+          spec:
+            client: "1"
+            dependencies:
+              - -r ../requirements.txt
+
+    train:
+      name: fraud-pipeline-train
+      description: >-
+        Offline feature build (leakage-safe point-in-time windows, shared with
+        the streaming job via src.pipeline.features) + XGBoost training.
+        Writes models/model.json, threshold.json, feature_columns.json,
+        metrics.json.
+      tasks:
+        - task_key: train_model
+          spark_python_task:
+            python_file: ../src/pipeline/train.py
+            parameters:
+              - "--input"
+              - "${var.input_csv}"
+          environment_key: fraud_pipeline_env
+      environments:
+        - environment_key: fraud_pipeline_env
+          spec:
+            client: "1"
+            dependencies:
+              - -r ../requirements.txt
+
+targets:
+  dev:
+    default: true
+    mode: development
+    workspace:
+      # Placeholder — replace with a real Databricks workspace URL to deploy.
+      host: https://<workspace-placeholder>.azuredatabricks.net
+    variables:
+      delta_root: /mnt/fraud-pipeline/delta-dev
