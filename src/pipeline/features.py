@@ -12,13 +12,22 @@ job) must be bit-for-bit reproducible offline (pandas, at training time).
 Two layers of features:
 
 1. **Event-level enrichment** (``enrich``) — pure, stateless derivations from a
-   single contract-v1 event: card-not-present flag, cross-border flag, MCC
-   grouping, log-amount, hour-of-day, day-of-week. No history required.
+   single contract-v1 event: card-not-present/chip/swipe flags, cross-border
+   flag, MCC grouping + raw MCC, current-event auth-error flag, log-amount,
+   hour-of-day, day-of-week. No history required — all available at
+   authorization time.
 2. **Windowed per-card aggregates** (``CARD_WINDOWS``) — count, amount
    sum/mean, distinct merchant-city count, and decline-ish rate over the
-   trailing 1 minute / 10 minutes / 1 hour of a card's activity, computed
+   trailing 1 hour / 1 day / 7 days / 30 days of a card's activity, computed
    **strictly before** the event being scored (point-in-time correctness /
-   no label leakage).
+   no label leakage). TabFormer cards transact roughly daily, so windows
+   under an hour are almost always empty; 1h/1d/7d/30d actually capture
+   density variation, unlike the original 1m/10m/1h set.
+3. **Point-in-time history features** computed alongside the windows:
+   ``time_since_last_txn_s`` (seconds since the card's previous event, capped
+   at the 30d window) and ``is_new_city_30d`` (merchant_city not seen for
+   this card in the trailing 30 days), plus ``amount_over_mean_30d`` (current
+   amount relative to the card's 30d average spend).
 
 Streaming job (``run_stream``)
 -------------------------------
@@ -38,6 +47,18 @@ sliding windows per ``CARD_WINDOWS``, and in `foreachBatch`:
   * upserted into the Redis hash ``features:{card_token}`` (online store), and
   * appended to Delta tables ``{DELTA_ROOT}/events`` (raw enriched events) and
     ``{DELTA_ROOT}/card_features`` (windowed aggregates), for offline reuse.
+
+``time_since_last_txn_s`` and ``is_new_city_30d`` are NOT bucket aggregates —
+they're inherently sequential per-card state (see
+``_update_sequential_card_state``'s docstring), so the streaming job
+maintains them via a bounded per-microbatch pandas pass seeded from the
+PRE-BATCH Redis state (``features:{card_token}["last_event_ts"]`` and a
+``cities_30d:{card_token}`` Redis SET with TTL-based approximate pruning),
+rather than a Spark window aggregation. This is documented as an
+approximation relative to the EXACT point-in-time computation the offline
+trainer uses (``compute_offline_card_features`` /
+``compute_card_features_vectorized``); it has not been exercised against a
+live cluster in this repo (v1 is local-training-only per ADR 0001).
 """
 
 from __future__ import annotations
@@ -74,8 +95,15 @@ DELTA_ROOT = os.environ.get("DELTA_ROOT", "data/delta")
 
 # --- Shared feature spec (train/serve skew-prevention contract) ------------
 
-# Trailing windows evaluated per card_token, in seconds.
-CARD_WINDOWS: dict[str, int] = {"1m": 60, "10m": 600, "1h": 3600}
+# Trailing windows evaluated per card_token, in seconds. TabFormer cards
+# transact roughly daily, so sub-hour windows are almost always empty; 1h is
+# kept for burst detection, 1d/7d/30d capture the density signal that
+# actually varies card-to-card.
+CARD_WINDOWS: dict[str, int] = {"1h": 3600, "1d": 86400, "7d": 604800, "30d": 2592000}
+
+# time_since_last_txn_s is capped at this many seconds (= the 30d window) so
+# a dormant/new card doesn't produce an unbounded feature value.
+_TIME_SINCE_LAST_TXN_CAP_SECONDS = float(CARD_WINDOWS["30d"])
 
 # The per-window aggregate metrics computed for each window in CARD_WINDOWS.
 _WINDOW_METRICS = ("txn_count", "amount_sum", "amount_mean", "distinct_merchant_city", "decline_rate")
@@ -134,8 +162,11 @@ def _parse_event_time(event_time: str) -> datetime:
 def enrich(event: dict[str, Any]) -> dict[str, Any]:
     """Pure, stateless per-event derived features (no history required).
 
-    Returns a dict with keys: is_cnp, is_cross_border, mcc_group, mcc_group_id,
-    amount_log, hour_of_day, day_of_week.
+    Returns a dict with keys: is_cnp, is_chip, is_swipe, is_cross_border,
+    mcc_group, mcc_group_id, mcc, has_error, amount_log, hour_of_day,
+    day_of_week. Every one of these is available at authorization time (the
+    current event's own fields), so it's safe to use both offline and online
+    with no history lookup.
     """
     channel = event["channel"]
     merchant_country = event["merchant_country"]
@@ -147,9 +178,13 @@ def enrich(event: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "is_cnp": channel == "online",
+        "is_chip": channel == "chip",
+        "is_swipe": channel == "swipe",
         "is_cross_border": merchant_country not in ("US", "XX"),
         "mcc_group": mcc_group,
         "mcc_group_id": MCC_GROUP_IDS[mcc_group],
+        "mcc": mcc,
+        "has_error": bool(event.get("errors")),
         "amount_log": math.log1p(abs(amount)),
         "hour_of_day": event_dt.hour,
         "day_of_week": event_dt.weekday(),
@@ -168,15 +203,23 @@ def _empty_window_features(window_key: str) -> dict[str, float]:
 
 
 # The ordered list of columns the model trains/serves on. Event-level
-# enrichments first, then each window's aggregates in CARD_WINDOWS order.
+# enrichments first, then point-in-time history features, then each window's
+# aggregates in CARD_WINDOWS order.
 FEATURE_COLUMNS: list[str] = [
     "amount",
     "amount_log",
     "is_cnp",
+    "is_chip",
+    "is_swipe",
     "is_cross_border",
     "mcc_group_id",
+    "mcc",
+    "has_error",
     "hour_of_day",
     "day_of_week",
+    "time_since_last_txn_s",
+    "is_new_city_30d",
+    "amount_over_mean_30d",
     *[name for window_key in CARD_WINDOWS for name in window_feature_names(window_key)],
 ]
 
@@ -191,15 +234,29 @@ def compute_offline_card_features(events: list[dict[str, Any]]) -> list[dict[str
     features). Returns a list aligned index-for-index with the time-sorted
     input.
 
+    Each result dict also carries ``last_event_ts`` (epoch seconds of the
+    card's immediately-preceding event, or None for the card's first event)
+    and ``is_new_city_30d`` (bool: merchant_city not seen in the trailing 30d
+    window). ``last_event_ts`` is deliberately NOT the final
+    ``time_since_last_txn_s`` feature — ``build_feature_row`` derives that,
+    which is the one place (shared by the offline and online/Redis paths)
+    that turns "timestamp of the last event" into "seconds since the last
+    event", so a live-serving caller only needs to supply the same
+    `last_event_ts` value (as stored in the Redis feature hash) with no
+    special-case logic of its own.
+
     Implemented with a per-window sliding deque so each window is O(n) in the
     number of events for the card, not O(n^2).
     """
     order = sorted(range(len(events)), key=lambda i: events[i]["event_time"])
     sorted_events = [events[i] for i in order]
     n = len(sorted_events)
-    times = [_parse_event_time(e["event_time"]) for e in sorted_events]
+    time_secs = [_parse_event_time(e["event_time"]).timestamp() for e in sorted_events]
 
     results: list[dict[str, float]] = [dict() for _ in range(n)]
+
+    for i in range(n):
+        results[i]["last_event_ts"] = time_secs[i - 1] if i > 0 else None
 
     for window_key, window_seconds in CARD_WINDOWS.items():
         window_delta = window_seconds  # seconds
@@ -212,8 +269,8 @@ def compute_offline_card_features(events: list[dict[str, Any]]) -> list[dict[str
             # Advance the window to include all prior events within window_seconds
             # of the CURRENT event's time, then evict anything now stale, BEFORE
             # folding in features for `right` itself (features must exclude it).
-            cutoff = times[right].timestamp() - window_delta
-            while buf and times[buf[0]].timestamp() < cutoff:
+            cutoff = time_secs[right] - window_delta
+            while buf and time_secs[buf[0]] < cutoff:
                 evicted = buf.popleft()
                 amount_sum -= sorted_events[evicted]["amount"]
                 city_counts[sorted_events[evicted]["merchant_city"]] -= 1
@@ -232,6 +289,10 @@ def compute_offline_card_features(events: list[dict[str, Any]]) -> list[dict[str
             results[right][f"distinct_merchant_city_{window_key}"] = float(len(city_counts))
             results[right][f"decline_rate_{window_key}"] = error_count / count if count else 0.0
 
+            if window_key == "30d":
+                current_city = sorted_events[right]["merchant_city"]
+                results[right]["is_new_city_30d"] = float(city_counts.get(current_city, 0) == 0)
+
             # Now that features for `right` are recorded, add it to the window
             # so it becomes available to future events.
             buf.append(right)
@@ -247,18 +308,50 @@ def compute_offline_card_features(events: list[dict[str, Any]]) -> list[dict[str
     return output  # type: ignore[return-value]
 
 
-def build_feature_row(event: dict[str, Any], window_features: dict[str, float]) -> dict[str, Any]:
+def build_feature_row(event: dict[str, Any], window_features: dict[str, Any]) -> dict[str, Any]:
     """Combine an event's enrichment + precomputed window features into one
-    row keyed exactly by FEATURE_COLUMNS (plus card_token/label passthrough)."""
+    row keyed exactly by FEATURE_COLUMNS (plus card_token/label passthrough).
+
+    `window_features` is intentionally loosely typed: offline it's the dict
+    `compute_offline_card_features` produced for this event (native floats
+    and a `last_event_ts`/`is_new_city_30d` pair); online it can be a Redis
+    hash (string values) for the same card, keyed the same way — this
+    function is the ONE place that derives `time_since_last_txn_s` from
+    `last_event_ts`, so a serving caller (e.g. src/app.py) needs no special
+    logic beyond fetching the hash and passing it straight through.
+    """
     enriched = enrich(event)
-    row: dict[str, Any] = {"card_token": event["card_token"], "amount": event["amount"]}
+    row: dict[str, Any] = {"card_token": event["card_token"], "amount": float(event["amount"])}
     row["amount_log"] = enriched["amount_log"]
     row["is_cnp"] = int(enriched["is_cnp"])
+    row["is_chip"] = int(enriched["is_chip"])
+    row["is_swipe"] = int(enriched["is_swipe"])
     row["is_cross_border"] = int(enriched["is_cross_border"])
     row["mcc_group_id"] = enriched["mcc_group_id"]
+    row["mcc"] = enriched["mcc"]
+    row["has_error"] = int(enriched["has_error"])
     row["hour_of_day"] = enriched["hour_of_day"]
     row["day_of_week"] = enriched["day_of_week"]
-    row.update(window_features)
+
+    for key, value in window_features.items():
+        if key in ("last_event_ts", "is_new_city_30d"):
+            continue
+        row[key] = value
+
+    is_new_city_raw = window_features.get("is_new_city_30d", 1)
+    row["is_new_city_30d"] = int(bool(float(is_new_city_raw)))
+
+    last_event_ts = window_features.get("last_event_ts")
+    if last_event_ts is None or last_event_ts == "":
+        row["time_since_last_txn_s"] = _TIME_SINCE_LAST_TXN_CAP_SECONDS
+    else:
+        current_ts = _parse_event_time(event["event_time"]).timestamp()
+        delta = current_ts - float(last_event_ts)
+        row["time_since_last_txn_s"] = max(0.0, min(delta, _TIME_SINCE_LAST_TXN_CAP_SECONDS))
+
+    mean_30d = float(window_features.get("amount_mean_30d", 0.0) or 0.0)
+    row["amount_over_mean_30d"] = row["amount"] / (mean_30d or 1.0)
+
     return row
 
 
@@ -268,18 +361,21 @@ def enrich_vectorized(
     amount: "pd.Series",
     mcc: "pd.Series",
     event_time: "pd.Series",
+    has_error: "pd.Series",
 ) -> "pd.DataFrame":
     """Vectorized equivalent of `enrich()` applied to whole columns at once.
 
-    Same semantics as the per-event function (is_cnp, is_cross_border,
-    mcc_group_id, amount_log, hour_of_day, day_of_week) — used by the
-    fast/vectorized training path so 24M rows don't pay per-row Python
-    function-call overhead.
+    Same semantics as the per-event function (is_cnp, is_chip, is_swipe,
+    is_cross_border, mcc_group_id, mcc, has_error, amount_log, hour_of_day,
+    day_of_week) — used by the fast/vectorized training path so 24M rows
+    don't pay per-row Python function-call overhead.
     """
     import numpy as np
     import pandas as pd
 
     is_cnp = (channel == "online").astype("int64")
+    is_chip = (channel == "chip").astype("int64")
+    is_swipe = (channel == "swipe").astype("int64")
     is_cross_border = (~merchant_country.isin(["US", "XX"])).astype("int64")
 
     exact_group = mcc.map(_MCC_EXACT_GROUPS)
@@ -296,8 +392,12 @@ def enrich_vectorized(
     return pd.DataFrame(
         {
             "is_cnp": is_cnp,
+            "is_chip": is_chip,
+            "is_swipe": is_swipe,
             "is_cross_border": is_cross_border,
             "mcc_group_id": mcc_group_id,
+            "mcc": mcc.astype("int64"),
+            "has_error": has_error.astype("int64"),
             "amount_log": amount_log,
             "hour_of_day": hour_of_day,
             "day_of_week": day_of_week,
@@ -306,10 +406,15 @@ def enrich_vectorized(
     )
 
 
-def _distinct_count_in_expanding_ranges(city_codes: "np.ndarray", left: "np.ndarray") -> "np.ndarray":
+def _distinct_count_in_expanding_ranges(
+    city_codes: "np.ndarray", left: "np.ndarray"
+) -> tuple[list[int], list[int]]:
     """For a single card's events (already time-sorted), return, for each
-    position i, the number of DISTINCT city codes in the half-open range
-    [left[i], i) — i.e. strictly-before-i history, windowed by `left`.
+    position i: (a) the number of DISTINCT city codes in the half-open range
+    [left[i], i) — i.e. strictly-before-i history, windowed by `left` — and
+    (b) whether city_codes[i] itself is NEW relative to that same range (1 if
+    city_codes[i] does not appear in [left[i], i), else 0). (b) is used for
+    `is_new_city_30d` when this is called with the 30d window's `left` array.
 
     `left` (the window's start index per position) must be non-decreasing,
     which holds here because it is derived from a monotonic time cutoff
@@ -319,7 +424,8 @@ def _distinct_count_in_expanding_ranges(city_codes: "np.ndarray", left: "np.ndar
     allocation, just a small int->int frequency map over city codes.
     """
     n = len(city_codes)
-    out = [0] * n
+    distinct_out = [0] * n
+    is_new_out = [0] * n
     freq: dict[int, int] = {}
     distinct = 0
     lo = 0
@@ -343,8 +449,9 @@ def _distinct_count_in_expanding_ranges(city_codes: "np.ndarray", left: "np.ndar
             else:
                 freq[c] = cnt
             lo += 1
-        out[i] = distinct
-    return out
+        distinct_out[i] = distinct
+        is_new_out[i] = 1 if freq.get(int(city_codes[i]), 0) == 0 else 0
+    return distinct_out, is_new_out
 
 
 def compute_card_features_vectorized(events_df: "pd.DataFrame") -> "pd.DataFrame":
@@ -363,21 +470,31 @@ def compute_card_features_vectorized(events_df: "pd.DataFrame") -> "pd.DataFrame
     per card via `_distinct_count_in_expanding_ranges` — but that loop touches
     plain ints, never per-event dicts/objects, which is what actually made the
     row-wise reference implementation too slow at 24M-row scale (datetime
-    parsing + dict/Counter[str] construction per event).
+    parsing + dict/Counter[str] construction per event). The same loop's
+    "is new" byproduct (from the 30d window pass) becomes `is_new_city_30d`.
+    `time_since_last_txn_s` is a plain vectorized `diff` per card group
+    (capped at the 30d window) since it needs no windowing at all — it's
+    always just "this event's time minus the previous event's time".
 
     The only genuine Python-level loop here iterates over CARD groups (at
     most a few thousand for TabFormer), not over rows.
 
-    Returns a DataFrame of window feature columns aligned to `events_df`'s
-    original row order (its index is preserved).
+    Returns a DataFrame with columns = window feature names +
+    "time_since_last_txn_s" + "is_new_city_30d", aligned to `events_df`'s
+    original row order (its index is preserved). Note this does NOT include
+    `amount_over_mean_30d` — that's a trivial ratio against `amount_mean_30d`
+    that the caller (`build_dataset_vectorized`) computes directly.
     """
     import numpy as np
     import pandas as pd
 
-    n_total = len(events_df)
     window_cols = [name for w in CARD_WINDOWS for name in window_feature_names(w)]
+    extra_cols = ["time_since_last_txn_s", "is_new_city_30d"]
+    all_cols = window_cols + extra_cols
+
+    n_total = len(events_df)
     if n_total == 0:
-        return pd.DataFrame(columns=window_cols, index=events_df.index)
+        return pd.DataFrame(columns=all_cols, index=events_df.index)
 
     work = events_df.reset_index(drop=True)
     seq = np.arange(n_total)
@@ -399,7 +516,7 @@ def compute_card_features_vectorized(events_df: "pd.DataFrame") -> "pd.DataFrame
     city_sorted = city_codes_all[sort_order]
 
     n = len(sort_order)
-    out_cols: dict[str, "np.ndarray"] = {c: np.zeros(n, dtype="float64") for c in window_cols}
+    out_cols: dict[str, "np.ndarray"] = {c: np.zeros(n, dtype="float64") for c in all_cols}
 
     # Group boundaries: card_sorted is contiguous-by-group after the sort above.
     group_start_positions = np.flatnonzero(np.r_[True, card_sorted[1:] != card_sorted[:-1]])
@@ -408,11 +525,22 @@ def compute_card_features_vectorized(events_df: "pd.DataFrame") -> "pd.DataFrame
     amount_prefix_global = np.concatenate(([0.0], np.cumsum(amount_sorted)))
     error_prefix_global = np.concatenate(([0.0], np.cumsum(error_sorted)))
 
+    cap_seconds = _TIME_SINCE_LAST_TXN_CAP_SECONDS
+
     for start, end in zip(group_start_positions, group_end_positions, strict=True):
         times_g = time_sorted[start:end]
         amount_prefix_g = amount_prefix_global[start : end + 1] - amount_prefix_global[start]
         error_prefix_g = error_prefix_global[start : end + 1] - error_prefix_global[start]
         idx = np.arange(len(times_g))
+        len_g = end - start
+
+        # time_since_last_txn_s: pure diff against the previous event in this
+        # card's history, capped; first event in the card's history gets the cap.
+        diffs = np.empty(len_g, dtype="float64")
+        diffs[0] = cap_seconds
+        if len_g > 1:
+            diffs[1:] = np.minimum(times_g[1:] - times_g[:-1], cap_seconds)
+        out_cols["time_since_last_txn_s"][start:end] = diffs
 
         for window_key, window_seconds in CARD_WINDOWS.items():
             cutoff = times_g - window_seconds
@@ -425,7 +553,7 @@ def compute_card_features_vectorized(events_df: "pd.DataFrame") -> "pd.DataFrame
                 amount_mean = np.where(count > 0, amount_sum / np.maximum(count, 1), 0.0)
                 decline_rate = np.where(count > 0, error_count / np.maximum(count, 1), 0.0)
 
-            distinct = _distinct_count_in_expanding_ranges(city_sorted[start:end], left)
+            distinct, is_new = _distinct_count_in_expanding_ranges(city_sorted[start:end], left)
 
             out_cols[f"txn_count_{window_key}"][start:end] = count
             out_cols[f"amount_sum_{window_key}"][start:end] = amount_sum
@@ -433,13 +561,16 @@ def compute_card_features_vectorized(events_df: "pd.DataFrame") -> "pd.DataFrame
             out_cols[f"distinct_merchant_city_{window_key}"][start:end] = distinct
             out_cols[f"decline_rate_{window_key}"][start:end] = decline_rate
 
+            if window_key == "30d":
+                out_cols["is_new_city_30d"][start:end] = is_new
+
     # Undo the sort: out_cols are in `sort_order` order; scatter back to the
     # original row order of `events_df`.
     result = pd.DataFrame(out_cols)
     result["_orig_pos"] = sort_order
     result = result.sort_values("_orig_pos", kind="mergesort").drop(columns="_orig_pos")
     result.index = events_df.index
-    return result[window_cols]
+    return result[all_cols]
 
 
 # --- Spark Structured Streaming job (lazy pyspark import; not needed for tests) --
@@ -506,6 +637,66 @@ def _foreach_batch(batch_df, batch_id: int) -> None:  # pragma: no cover - exerc
     pipe.execute()
 
 
+def _update_sequential_card_state(
+    events_pdf: "pd.DataFrame", redis_client: Any
+) -> "pd.DataFrame":  # pragma: no cover - exercised only with a live cluster
+    """Maintain the two genuinely SEQUENTIAL (not window-aggregate) pieces of
+    per-card state: `last_event_ts` and the trailing-30d city set backing
+    `is_new_city_30d`.
+
+    Why this lives here instead of in the groupBy+window aggregation below:
+    Spark's `F.window` aggregation produces one row per (window bucket, card)
+    — perfect for txn_count/amount_sum/mean/distinct_city/decline_rate, but
+    "seconds since the literal previous event" and "has this exact city been
+    seen in the trailing 30 days" are inherently per-event sequential state,
+    not bucket aggregates. A microbatch is bounded in size, so pulling just
+    the (card_token, event_ts, merchant_city) columns to the driver via
+    `foreachBatch` and walking each card's events in order — seeded from the
+    PRE-BATCH Redis state — is the standard escape hatch Structured
+    Streaming's `foreachBatch` exists for.
+
+    Approximation, documented: the 30d city set is pruned via a Redis TTL
+    refresh (`EXPIRE cities_30d:{card_token} 30d` on every touch) rather than
+    an exact per-city sliding eviction — a card whose city set hasn't
+    changed in 30 days keeps a slightly stale membership until its next
+    event. This is exact enough for a burst-detection/anomaly signal and is
+    NOT used by the offline trainer (which computes this exactly via
+    `compute_offline_card_features`/`compute_card_features_vectorized`).
+
+    Returns `events_pdf` with two added columns: `last_event_ts` (float,
+    seconds, may be NaN for a card's very first event ever) and
+    `is_new_city_30d` (0/1).
+    """
+    import pandas as pd
+
+    events_pdf = events_pdf.sort_values(["card_token", "event_ts"], kind="mergesort").reset_index(drop=True)
+    last_event_ts_col = pd.Series(index=events_pdf.index, dtype="float64")
+    is_new_city_col = pd.Series(index=events_pdf.index, dtype="int64")
+
+    for card_token, group in events_pdf.groupby("card_token", sort=False):
+        prev_ts_raw = redis_client.hget(f"features:{card_token}", "last_event_ts")
+        prev_ts = float(prev_ts_raw) if prev_ts_raw not in (None, "") else None
+        cities_key = f"cities_30d:{card_token}"
+        seen_cities = set(redis_client.smembers(cities_key))
+
+        for idx, row in group.iterrows():
+            ts = row["event_ts"].timestamp()
+            city = row["merchant_city"]
+            last_event_ts_col.at[idx] = prev_ts if prev_ts is not None else float("nan")
+            is_new_city_col.at[idx] = 0 if city in seen_cities else 1
+            prev_ts = ts
+            seen_cities.add(city)
+
+        redis_client.hset(f"features:{card_token}", mapping={"last_event_ts": prev_ts})
+        if seen_cities:
+            redis_client.sadd(cities_key, *seen_cities)
+        redis_client.expire(cities_key, int(CARD_WINDOWS["30d"]))
+
+    events_pdf["last_event_ts"] = last_event_ts_col
+    events_pdf["is_new_city_30d"] = is_new_city_col
+    return events_pdf
+
+
 def run_stream(once: bool = False) -> None:  # pragma: no cover - requires a live Kafka/Spark cluster
     """Consume KAFKA_TOPIC_TRANSACTIONS, compute windowed card features, sink
     to Redis (online) + Delta (offline). `once=True` uses trigger(availableNow)
@@ -550,6 +741,8 @@ def run_stream(once: bool = False) -> None:  # pragma: no cover - requires a liv
     invalid_df = parsed.filter(~is_valid)
 
     def sink_batch(batch_df, batch_id: int) -> None:
+        import redis
+
         invalid, valid = batch_df.filter(~is_valid), batch_df.filter(is_valid)
         if invalid.take(1):
             invalid.write.format("delta").mode("append").save(quarantine_path)
@@ -557,11 +750,14 @@ def run_stream(once: bool = False) -> None:  # pragma: no cover - requires a liv
             enriched = (
                 valid.withColumn("event_ts", F.to_timestamp("event_time"))
                 .withColumn("is_cnp", F.col("channel") == F.lit("online"))
+                .withColumn("is_chip", F.col("channel") == F.lit("chip"))
+                .withColumn("is_swipe", F.col("channel") == F.lit("swipe"))
                 .withColumn(
                     "is_cross_border",
                     ~F.col("merchant_country").isin("US", "XX"),
                 )
                 .withColumn("amount_log", F.log1p(F.abs(F.col("amount"))))
+                .withColumn("has_error", F.col("errors").isNotNull())
                 .withColumn("hour_of_day", F.hour("event_ts"))
                 .withColumn("day_of_week", F.dayofweek("event_ts"))
                 .withColumn("updated_at", F.current_timestamp().cast("string"))
@@ -586,6 +782,17 @@ def run_stream(once: bool = False) -> None:  # pragma: no cover - requires a liv
                     .withColumn("updated_at", F.current_timestamp().cast("string"))
                 )
                 _foreach_batch(agg, batch_id)
+
+            # Sequential per-card state (last_event_ts, is_new_city_30d) — see
+            # _update_sequential_card_state docstring for why this can't be a
+            # groupBy+window aggregate like the metrics above. `amount` here
+            # is not written to Redis at all: amount_over_mean_30d is derived
+            # at build_feature_row time from `amount_mean_30d` (already
+            # upserted above), the same "no extra Redis field" pattern as
+            # time_since_last_txn_s deriving from last_event_ts.
+            small_cols_pdf = enriched.select("card_token", "event_ts", "merchant_city").toPandas()
+            redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+            _update_sequential_card_state(small_cols_pdf, redis_client)
 
             enriched.write.format("delta").mode("append").save(os.path.join(DELTA_ROOT, "events"))
 
