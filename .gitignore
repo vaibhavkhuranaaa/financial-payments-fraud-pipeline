@@ -17,3 +17,12 @@ data/*
 .env
 .env.*
 !.env.example
+
+# Artifacts
+models/
+data/delta/
+*.duckdb
+dbt/target/
+dbt/logs/
+.terraform/
+*.tfstate*

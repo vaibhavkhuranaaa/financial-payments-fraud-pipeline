@@ -1,0 +1,4 @@
+# Dev/CI dependencies
+ruff==0.5.7
+pytest==8.3.2
+dbt-duckdb==1.8.3

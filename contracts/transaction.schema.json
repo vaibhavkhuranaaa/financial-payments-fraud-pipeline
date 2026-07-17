@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/vaibhavkhurana/financial-payments-fraud-pipeline/contracts/transaction.schema.json",
+  "title": "PaymentTransaction",
+  "description": "Data contract v1 for card transaction events on the `transactions` topic. Producers MUST validate before publish; the stream job re-validates and routes violations to `transactions.dlq`. card_token is a salted SHA-256 token — raw PANs/card identifiers never cross the wire.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "event_time",
+    "card_token",
+    "user_id",
+    "amount",
+    "currency",
+    "channel",
+    "merchant_name",
+    "merchant_city",
+    "merchant_state",
+    "merchant_country",
+    "mcc"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "event_id": { "type": "string", "format": "uuid" },
+    "event_time": { "type": "string", "format": "date-time", "description": "Transaction timestamp, UTC ISO-8601" },
+    "card_token": { "type": "string", "pattern": "^[a-f0-9]{64}$", "description": "SHA-256(salt || user_id:card_id)" },
+    "user_id": { "type": "string", "minLength": 1 },
+    "amount": { "type": "number", "description": "Transaction amount in `currency` units; negatives are reversals/credits" },
+    "currency": { "type": "string", "pattern": "^[A-Z]{3}$", "description": "ISO-4217; TabFormer source is USD" },
+    "channel": {
+      "type": "string",
+      "enum": ["chip", "swipe", "online"],
+      "description": "Card-present (chip/swipe) vs card-not-present (online)"
+    },
+    "merchant_name": { "type": "string", "minLength": 1, "description": "Opaque merchant identifier from source data" },
+    "merchant_city": { "type": "string" },
+    "merchant_state": { "type": "string", "description": "US state code, or foreign country name for cross-border txns; 'ONLINE' for online txns" },
+    "merchant_country": { "type": "string", "pattern": "^[A-Z]{2}$", "description": "Derived ISO-3166 alpha-2; 'US' domestic, 'XX' unknown" },
+    "zip": { "type": ["string", "null"], "description": "Merchant ZIP; null for online/foreign" },
+    "mcc": { "type": "integer", "minimum": 0, "maximum": 9999, "description": "Merchant category code" },
+    "errors": { "type": ["string", "null"], "description": "Authorization error codes from source (e.g. 'Insufficient Balance'), comma-separated" },
+    "is_fraud": { "type": ["boolean", "null"], "description": "Ground-truth label; present only in replay/training flows, never emitted by production authorization systems" }
+  }
+}

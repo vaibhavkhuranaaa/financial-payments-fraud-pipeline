@@ -1,4 +1,15 @@
-flask
-pyspark
-xgboost
-azure-eventhub
+# Runtime dependencies — Python 3.11 (see docs/SETUP.md; system 3.14 unsupported by PySpark 3.5)
+flask==3.0.3
+gunicorn==22.0.0
+xgboost==2.1.1
+pyspark==3.5.1
+delta-spark==3.2.0
+confluent-kafka==2.5.0
+redis==5.0.8
+jsonschema==4.23.0
+pandas==2.2.2
+pyarrow==16.1.0
+scikit-learn==1.5.1
+prometheus-client==0.20.0
+python-dotenv==1.0.1
+requests==2.32.3
