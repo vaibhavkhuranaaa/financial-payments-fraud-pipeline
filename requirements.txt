@@ -1,0 +1,4 @@
+flask
+pyspark
+xgboost
+azure-eventhub
