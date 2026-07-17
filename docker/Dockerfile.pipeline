@@ -1,0 +1,38 @@
+# Shared image for the replay producer and the Spark Structured Streaming
+# feature job. Same image, different `command:` override in docker-compose.
+FROM python:3.11-slim
+
+# PySpark needs a JRE. eclipse-temurin JDK17 is the closest supported runtime
+# per docs/adr/0001 (Python 3.11 pinned venv note). Use Debian's default
+# headless JRE to avoid adding the Adoptium apt repo inside the image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        default-jre-headless \
+        curl \
+        procps \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/default-java \
+    PYTHONUNBUFFERED=1
+
+RUN groupadd --gid 1000 appuser \
+    && useradd --uid 1000 --gid appuser --shell /usr/sbin/nologin --create-home appuser
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY src/ /app/src/
+COPY contracts/ /app/contracts/
+COPY data/sample/ /app/data/sample/
+
+RUN mkdir -p /app/data/delta /app/models \
+    && chown -R appuser:appuser /app
+
+USER appuser
+
+# No default CMD — docker-compose selects `ingestion` (producer) or
+# `features --run-stream` per service.
+ENTRYPOINT ["python", "-m"]
+CMD ["src.pipeline.features", "--run-stream"]

@@ -6,14 +6,28 @@ on:
   pull_request:
 
 jobs:
-  lint:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install lint tools
-        run: pip install flake8
-      - name: Lint
-        run: flake8 src --max-line-length=120 || true
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Run checks (lint, tests, dbt, terraform, compose config)
+        run: bash scripts/check.sh
+
+      - name: Build api image
+        run: docker build -f docker/Dockerfile.api -t fraud-api:ci .
+
+      - name: Build pipeline image
+        run: docker build -f docker/Dockerfile.pipeline -t fraud-pipeline:ci .

@@ -1,1 +1,109 @@
-# TODO: implement per CLAUDE.md
+# Local dev stack for the fraud pipeline. Run from repo root:
+#   docker compose -f docker/docker-compose.yml up
+# Producer is opt-in (profile "replay"):
+#   docker compose -f docker/docker-compose.yml --profile replay up producer
+#
+# Contexts are `..` (repo root) so Dockerfiles can COPY src/, contracts/, etc.
+name: fraud-pipeline
+
+x-pipeline-env: &pipeline-env
+  KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+  KAFKA_SECURITY_PROTOCOL: PLAINTEXT
+  KAFKA_SASL_MECHANISM: ${KAFKA_SASL_MECHANISM:-}
+  KAFKA_SASL_USERNAME: ${KAFKA_SASL_USERNAME:-}
+  KAFKA_SASL_PASSWORD: ${KAFKA_SASL_PASSWORD:-}
+  KAFKA_TOPIC_TRANSACTIONS: ${KAFKA_TOPIC_TRANSACTIONS:-transactions}
+  KAFKA_TOPIC_DLQ: ${KAFKA_TOPIC_DLQ:-transactions.dlq}
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  DELTA_ROOT: /app/data/delta
+  TOKENIZATION_SALT: ${TOKENIZATION_SALT:-change-me-local-only}
+  PRODUCER_EVENTS_PER_SEC: ${PRODUCER_EVENTS_PER_SEC:-200}
+  PRODUCER_INPUT_CSV: ${PRODUCER_INPUT_CSV:-data/sample/transactions_sample.csv}
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:latest
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --set=redpanda.auto_create_topics_enabled=true
+    ports:
+      - "19092:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  spark-features:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pipeline
+    container_name: spark-features
+    command: ["src.pipeline.features", "--run-stream"]
+    environment:
+      <<: *pipeline-env
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../data:/app/data
+      - ../models:/app/models
+
+  producer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pipeline
+    container_name: producer
+    profiles: ["replay"]
+    command:
+      [
+        "src.pipeline.ingestion",
+        "--input", "data/sample/transactions_sample.csv",
+      ]
+    environment:
+      <<: *pipeline-env
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    volumes:
+      - ../data:/app/data
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    container_name: api
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MODEL_DIR: /app/models
+      SCORE_THRESHOLD_PATH: /app/models/threshold.json
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../models:/app/models
