@@ -106,3 +106,59 @@ services:
         condition: service_healthy
     volumes:
       - ../models:/app/models
+
+  # Core-banking system-of-record (ticket 06). Azure SQL Edge is the
+  # ARM-native SQL Server-compatible image (Docker Desktop/Colima on Apple
+  # Silicon can't run full mssql-server). Opt-in via the "demo" profile since
+  # it isn't part of the v1.0 streaming path.
+  bank-db:
+    image: mcr.microsoft.com/azure-sql-edge:latest
+    container_name: bank-db
+    profiles: ["demo"]
+    environment:
+      ACCEPT_EULA: "1"
+      MSSQL_SA_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+    ports:
+      - "1433:1433"
+    volumes:
+      - bank-db-data:/var/opt/mssql
+    healthcheck:
+      # azure-sql-edge ships no sqlcmd/mssql-tools; the image *does* have bash,
+      # so probe port 1433 with bash's /dev/tcp pseudo-device instead of
+      # installing anything extra. This only proves the TCP listener is up
+      # (not "accepting logins"), which is why start_period is generous and
+      # init-bank/seed.py retries via SQLAlchemy's pool_pre_ping regardless.
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'exec 3<>/dev/tcp/127.0.0.1/1433' || exit 1",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  # One-shot: apply schema.sql + seed bank.customers/accounts/cards, then exit.
+  # Reuses the pipeline image (pymssql/sqlalchemy/faker added to requirements.txt).
+  init-bank:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pipeline
+    container_name: init-bank
+    profiles: ["demo"]
+    command: ["src.bank.seed", "--input", "data/sample/transactions_sample.csv"]
+    environment:
+      BANK_DB_HOST: bank-db
+      BANK_DB_PORT: 1433
+      BANK_DB_USER: sa
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_NAME: ${BANK_DB_NAME:-master}
+      TOKENIZATION_SALT: ${TOKENIZATION_SALT:-change-me-local-only}
+    depends_on:
+      bank-db:
+        condition: service_healthy
+    volumes:
+      - ../data:/app/data
+
+volumes:
+  bank-db-data:
