@@ -35,14 +35,28 @@ Two layers of fields flow through this pipeline:
 | `amount` | float | passthrough of contract `amount` | Raw transaction amount. |
 | `amount_log` | float | `log1p(abs(amount))` | Log-scaled amount; compresses the long right tail of transaction sizes. |
 | `is_cnp` | int (0/1) | `channel == "online"` | Card-not-present flag. |
+| `is_chip` | int (0/1) | `channel == "chip"` | Chip (card-present) transaction flag. |
+| `is_swipe` | int (0/1) | `channel == "swipe"` | Magstripe-swipe transaction flag. |
 | `is_cross_border` | int (0/1) | `merchant_country not in ("US", "XX")` | Cross-border transaction flag. |
 | `mcc_group_id` | int | `MCC_GROUP_IDS[_mcc_group(mcc)]` | Ordinal id for the coarse spend category (`travel`=0, `grocery`=1, `cash`=2, `online_retail`=3, `other`=4). See `_MCC_EXACT_GROUPS`/range rules in `features.py`. |
+| `mcc` | int | passthrough of contract `mcc` | Raw merchant category code (lets the trees split finer than the coarse groups). |
+| `has_error` | int (0/1) | `bool(event["errors"])` | Current event carries a non-null auth-error code. |
 | `hour_of_day` | int (0–23) | `event_time.hour` (UTC) | Time-of-day signal. |
 | `day_of_week` | int (0–6) | `event_time.weekday()` | Day-of-week signal (0=Monday). |
 
-### Windowed per-card aggregates (`CARD_WINDOWS = {1m, 10m, 1h}`)
+### Point-in-time history features (sequential, not window aggregates)
 
-Computed **strictly before** the event being scored (point-in-time correctness — the scored event never contributes to its own features). For each window key `w` in `{1m, 10m, 1h}`:
+Computed from the card's history strictly before the scored event (`build_feature_row` derives them; online, `last_event_ts` and the trailing-city set live in Redis):
+
+| Feature | Type | Meaning |
+|---|---|---|
+| `time_since_last_txn_s` | float | Seconds since the card's previous transaction, capped at the 30d window (a card's first-ever event gets the cap). |
+| `is_new_city_30d` | int (0/1) | Current `merchant_city` not seen for this card in the trailing 30 days. |
+| `amount_over_mean_30d` | float | Current amount divided by the card's trailing-30d mean amount (denominator 1.0 when no history). |
+
+### Windowed per-card aggregates (`CARD_WINDOWS = {1h, 1d, 7d, 30d}`)
+
+Computed **strictly before** the event being scored (point-in-time correctness — the scored event never contributes to its own features). Windows are density-matched to TabFormer's roughly-daily card activity (sub-hour windows were almost always empty). For each window key `w` in `{1h, 1d, 7d, 30d}`:
 
 | Feature (`{metric}_{w}`) | Type | Meaning |
 |---|---|---|

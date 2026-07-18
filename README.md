@@ -3,7 +3,7 @@
 A streaming, orchestrated fraud-detection pipeline over IBM's TabFormer synthetic credit-card transactions: contract-validated Kafka ingestion, Spark Structured Streaming windowed feature engineering with an online (Redis) / offline (Delta Lake) split, an XGBoost fraud classifier, and a latency-measured Flask scoring API — deployed to Azure Container Apps via Terraform. Built to demonstrate real streaming data-engineering discipline (schemas, train/serve-skew prevention, measured latency, IaC, teardown), not a static notebook.
 
 ## Problem
-Card-issuer fraud teams need a decision — approve or hold for review — in milliseconds, at the moment of authorization, using only what's known about a card's recent behavior plus the transaction itself. That means the hard part isn't the model; it's the pipeline: validating events at the door, computing point-in-time-correct behavioral features (a card's transaction velocity, spend, and decline pattern over the last minute/10 minutes/hour) without ever leaking the future into a feature, keeping the exact same feature logic online (serving) and offline (training), and serving a score under a tight latency budget. This project builds that pipeline end-to-end.
+Card-issuer fraud teams need a decision — approve or hold for review — in milliseconds, at the moment of authorization, using only what's known about a card's recent behavior plus the transaction itself. That means the hard part isn't the model; it's the pipeline: validating events at the door, computing point-in-time-correct behavioral features (a card's transaction velocity, spend, and decline pattern over the last hour/day/7 days/30 days) without ever leaking the future into a feature, keeping the exact same feature logic online (serving) and offline (training), and serving a score under a tight latency budget. This project builds that pipeline end-to-end.
 
 ## Data
 - **Source:** [IBM TabFormer](https://github.com/IBM/TabFormer) — large-scale (24M+ row) realistic *synthetic* credit-card transaction data, released by IBM for fraud-detection research. No real cardholders, no real PANs.
@@ -19,7 +19,7 @@ flowchart LR
     B -. invalid .-> C_DLQ[["transactions.dlq"]]
     C --> D["features.py\nSpark Structured Streaming\nre-validate + enrich"]
     D -. invalid .-> DQ[(Delta _quarantine)]
-    D --> E[Windowed aggregates\n1m / 10m / 1h per card]
+    D --> E[Windowed aggregates\n1h / 1d / 7d / 30d per card]
     E --> F[(Redis\nonline features)]
     D --> G[(Delta events)]
     E --> H[(Delta card_features)]
@@ -40,16 +40,19 @@ Full lineage detail (including the DLQ/quarantine dead-letter paths and exactly 
 
 ### Model (XGBoost, threshold chosen from the precision-recall curve)
 
-> **A full-data retrain is in flight.** `models/metrics.json` currently reflects a sample-data run whose chronological test split happened to land in a zero-fraud tail of the sample (see that file's `notes` field) — precision/recall/AUC from that run are not representative and are intentionally omitted below pending the full-data retrain.
+Trained on the full dataset (11.9M rows, 2013–2019, time-based train/valid/test split, ~0.13% fraud base rate). Metrics below are on the held-out chronological test fold (2.38M rows); full detail including the tuning history is in `models/metrics.json`.
 
 | Metric | Value |
 |---|---|
-| PR-AUC | `<PENDING METRICS>` |
-| ROC-AUC | `<PENDING METRICS>` |
-| Precision @ threshold | `<PENDING METRICS>` |
-| Recall @ threshold | `<PENDING METRICS>` |
-| Chosen threshold | `<PENDING METRICS>` |
-| Confusion matrix (tn/fp/fn/tp) | `<PENDING METRICS>` |
+| PR-AUC | 0.0227 (v1 feature set: 0.0029 — the 1h/1d/7d/30d density-matched windows are the difference) |
+| ROC-AUC | 0.768 |
+| Precision @ top-0.1% of scores | 0.045 (~34× lift over the 0.13% base rate — the ops-relevant number for a fixed review budget) |
+| Precision @ threshold | 0.0065 |
+| Recall @ threshold | 0.179 |
+| Chosen threshold | 0.0412 (max-F1 on the validation PR curve) |
+| Confusion matrix (tn/fp/fn/tp) | 2,290,089 / 87,226 / 2,611 / 568 |
+
+At a ~0.13% base rate, absolute precision is inherently low at any recall-bearing threshold; the ranking metrics (PR-AUC, precision@top-k) are the honest measure, and both improved ~8–34× over the v1 feature set after root-causing the near-empty 1m/10m/1h windows (TabFormer cards transact roughly daily).
 
 ### API latency (cold-path baseline, local)
 
@@ -117,7 +120,6 @@ Event Hubs **Standard** tier (required for the Kafka-compatible endpoint) is the
 - **Governance:** JSON-Schema data contract (`contracts/`), producer + in-stream re-validation with DLQ/quarantine dead-letter paths, salted-SHA-256 PAN tokenization, dbt tests as quality gates, data-dictionary/lineage/tokenization-policy docs (`docs/governance/`)
 
 ## What I'd Improve Next
-- **Full-data model metrics.** The committed `models/metrics.json` is from a sample run whose chronological split happened to skew all fraud into the training fold — the retrain on the full ~24M-row `data/raw/card_transaction.v1.csv` (in flight) is what should actually back the Key Results table above.
 - **Warm-Redis latency benchmark.** The only latency number in this README today is the cold-path (every card missing from Redis) baseline — the number that actually matters for production capacity planning is steady-state, with realistic Redis hit rates.
 - **dbt-over-DuckDB vs. a real warehouse.** The dbt project reads the sample CSV directly (via DuckDB's `read_csv_auto`), and `stg_transactions.sql` hand-mirrors `ingestion.py::to_event()`'s mapping logic in SQL rather than sharing one implementation — SQL can't import the Python module, so the two can drift if one changes without the other. On Databricks SQL, this staging model would instead read the same Delta tables the streaming job already writes, eliminating the duplication entirely.
 - **Single-node streaming.** Redpanda and the Spark job both run as single instances locally; there's no tested failover/rebalance story, and Spark's `foreachBatch` Redis writes are not currently idempotent under retry (a replayed microbatch after a crash could double-count a window's contribution if the same batch is retried non-atomically).
