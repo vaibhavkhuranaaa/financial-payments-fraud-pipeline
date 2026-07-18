@@ -19,9 +19,11 @@ Testability
 plain dict (what a Kafka message's JSON value decodes to), a ``requests``
 session, a SQLAlchemy engine, and a ``ScoreBuffer`` accumulator, and performs
 no Kafka calls itself. Tests drive it directly with mocked ``session``/
-``engine`` and a ``ScoreBuffer(batch_size=1)`` so every event flushes
-immediately and is assertable. The confluent_kafka ``Consumer`` only appears
-in ``run()``/``main()``.
+``engine`` and call ``flush`` explicitly. The confluent_kafka ``Consumer``
+only appears in ``run()``/``main()``, which owns the delivery-semantics
+boundary: auto-commit is off and offsets are committed synchronously only
+AFTER the buffered rows are flushed to the bank DB (commit-after-flush;
+redelivery is absorbed by the event_id PK dedupe).
 """
 
 from __future__ import annotations
@@ -241,10 +243,14 @@ def handle_event(
     engine: Engine,
     buffer: ScoreBuffer,
 ) -> bool:
-    """Score one event and buffer the resulting row(s), flushing to `engine`
-    when the buffer's batch/time threshold is reached. Returns True if the
-    event was scored (whether or not it flushed this call), False if it was
-    skipped (score request failed)."""
+    """Score one event and buffer the resulting row(s). Returns True if the
+    event was scored, False if it was skipped (score request failed).
+
+    Flushing is owned by the caller (`run`), which pairs every SQL flush with
+    a Kafka offset commit — the delivery-semantics boundary lives in exactly
+    one place. `engine` stays a parameter so tests can drive an explicit
+    `flush(engine, buffer)` after this returns."""
+    del engine  # flush ownership moved to run(); kept for test-facing signature
     score_response = score_event(session, event)
     if score_response is None:
         return False
@@ -253,9 +259,6 @@ def handle_event(
     alert_row = build_alert_row(event, score_response)
     buffer.add(scored_row, alert_row)
 
-    if buffer.should_flush():
-        flush(engine, buffer)
-
     return True
 
 
@@ -263,13 +266,36 @@ def _consumer_config() -> dict[str, Any]:
     config = kafka_config()
     config["group.id"] = CONSUMER_GROUP_ID
     config["auto.offset.reset"] = "earliest"
+    # At-least-once with a hard boundary: offsets are committed manually in
+    # run(), strictly AFTER the corresponding rows are flushed to the bank DB.
+    # A crash between flush and commit re-delivers already-written events,
+    # which the PK-dedupe in _insert_rows_swallow_duplicates absorbs — so the
+    # observable result in SQL is effectively-once.
+    config["enable.auto.commit"] = False
     return config
+
+
+def _commit_offsets(consumer: Any) -> None:
+    """Synchronously commit the consumer's current offsets, tolerating the
+    no-offsets-yet case (nothing consumed since the last commit)."""
+    from confluent_kafka import KafkaException
+
+    try:
+        consumer.commit(asynchronous=False)
+    except KafkaException as exc:
+        logger.debug("offset commit skipped: %s", exc)
 
 
 def run(max_events: int | None) -> int:
     """Consume from KAFKA_TOPIC_TRANSACTIONS and score/write until `max_events`
     have been consumed (or forever if None). Returns the count of events
-    successfully scored."""
+    successfully scored.
+
+    Delivery semantics: auto-commit is disabled; offsets are committed
+    synchronously immediately AFTER each SQL flush (and once more on
+    shutdown), so an event's offset is never committed before its scored row
+    is durable in the bank DB. Redelivery after a crash is absorbed by the
+    event_id PK dedupe on insert."""
     from confluent_kafka import Consumer
 
     consumer = Consumer(_consumer_config())
@@ -299,9 +325,15 @@ def run(max_events: int | None) -> int:
 
             if handle_event(event, session, engine, buffer):
                 scored += 1
+
+            if buffer.should_flush():
+                flush(engine, buffer)
+                _commit_offsets(consumer)
     finally:
         if buffer.scored_rows or buffer.alert_rows:
             flush(engine, buffer)
+        if consumed:
+            _commit_offsets(consumer)
         consumer.close()
 
     return scored

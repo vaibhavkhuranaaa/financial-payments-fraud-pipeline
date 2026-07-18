@@ -2,9 +2,9 @@
 
 Hermetic — no Kafka broker, no live DB, no live HTTP. `handle_event` is
 exercised directly with a fake Kafka-message-shaped dict, a mocked
-`requests.Session`, and a mocked SQLAlchemy engine (`ScoreBuffer(batch_size=1)`
-forces an immediate flush per call so assertions can inspect exactly what
-would have been executed).
+`requests.Session`, and a mocked SQLAlchemy engine; tests call `flush`
+explicitly (flush/commit ownership lives in `run()`, which is exercised with
+a fake confluent_kafka Consumer to pin the commit-after-flush ordering).
 """
 
 from __future__ import annotations
@@ -71,6 +71,7 @@ def test_handle_event_writes_scored_transactions_row_shape() -> None:
     buffer = scorer.ScoreBuffer(batch_size=1)
 
     result = scorer.handle_event(EVENT, session, mock_engine, buffer)
+    scorer.flush(mock_engine, buffer)
 
     assert result is True
     session.post.assert_called_once()
@@ -107,6 +108,7 @@ def test_handle_event_inserts_alert_only_above_threshold() -> None:
     buffer = scorer.ScoreBuffer(batch_size=1)
 
     scorer.handle_event(EVENT, session, mock_engine, buffer)
+    scorer.flush(mock_engine, buffer)
 
     # two execute()s: scored_transactions then fraud_alerts
     assert mock_conn.execute.call_count == 2
@@ -128,6 +130,7 @@ def test_handle_event_below_threshold_writes_no_alert() -> None:
     buffer = scorer.ScoreBuffer(batch_size=1)
 
     scorer.handle_event(EVENT, session, mock_engine, buffer)
+    scorer.flush(mock_engine, buffer)
 
     assert mock_conn.execute.call_count == 1  # only scored_transactions
 
@@ -142,6 +145,7 @@ def test_alert_threshold_env_override_takes_priority_over_response_threshold() -
     buffer = scorer.ScoreBuffer(batch_size=1)
 
     scorer.handle_event(EVENT, session, mock_engine, buffer)
+    scorer.flush(mock_engine, buffer)
 
     # response threshold (0.9) would not have alerted; override (0.3) does
     assert mock_conn.execute.call_count == 2
@@ -163,6 +167,7 @@ def test_duplicate_event_id_swallowed_on_batch_insert() -> None:
 
     # Should not raise: duplicate key is swallowed.
     scorer.handle_event(EVENT, session, mock_engine, buffer)
+    scorer.flush(mock_engine, buffer)
 
     assert mock_conn.execute.call_count == 2  # batch attempt + 1 row fallback
 
@@ -225,10 +230,13 @@ def test_score_buffer_defers_flush_until_batch_size_reached() -> None:
 
     event_1 = dict(EVENT, event_id="22222222-2222-2222-2222-222222222222")
     scorer.handle_event(event_1, session, mock_engine, buffer)
-    mock_conn.execute.assert_not_called()  # below batch_size, not flushed yet
+    assert buffer.should_flush() is False  # below batch_size, not flushable yet
+    mock_conn.execute.assert_not_called()
 
     event_2 = dict(EVENT, event_id="33333333-3333-3333-3333-333333333333")
     scorer.handle_event(event_2, session, mock_engine, buffer)
+    assert buffer.should_flush() is True
+    scorer.flush(mock_engine, buffer)
 
     assert mock_conn.execute.call_count == 1
     _, rows = mock_conn.execute.call_args.args
@@ -240,3 +248,72 @@ def test_kafka_consumer_config_sets_group_and_offset_reset() -> None:
     assert config["group.id"] == "scorer"
     assert config["auto.offset.reset"] == "earliest"
     assert "bootstrap.servers" in config
+    # Delivery semantics: offsets are committed manually, strictly after the
+    # SQL flush — auto-commit must be off or the boundary is meaningless.
+    assert config["enable.auto.commit"] is False
+
+
+class _FakeMessage:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def error(self):  # noqa: ANN201 — mirrors confluent_kafka.Message
+        return None
+
+    def value(self) -> bytes:
+        return self._payload
+
+
+class _FakeConsumer:
+    """Stands in for confluent_kafka.Consumer: serves canned messages and
+    records commit() calls into a shared ordered log."""
+
+    def __init__(self, messages: list[_FakeMessage], log: list[str]) -> None:
+        self._messages = list(messages)
+        self._log = log
+
+    def subscribe(self, topics: list[str]) -> None:
+        self.topics = topics
+
+    def poll(self, timeout: float) -> _FakeMessage | None:
+        return self._messages.pop(0) if self._messages else None
+
+    def commit(self, asynchronous: bool = True) -> None:
+        assert asynchronous is False, "offset commits must be synchronous"
+        self._log.append("commit")
+
+    def close(self) -> None:
+        self._log.append("close")
+
+
+def test_run_commits_offsets_only_after_sql_flush() -> None:
+    """The delivery-semantics boundary: with 60 messages and BATCH_SIZE=50,
+    run() must flush-then-commit mid-stream at 50 rows, and flush-then-commit
+    the 10-row remainder on shutdown — never commit before a flush."""
+    import json as _json
+
+    log: list[str] = []
+    payload = _json.dumps(EVENT).encode("utf-8")
+    messages = [_FakeMessage(payload) for _ in range(60)]
+
+    def fake_flush(engine, buffer) -> None:  # noqa: ANN001 — patch target
+        log.append("flush")
+        buffer.mark_flushed()
+
+    score_response = {
+        "fraud_probability": 0.1,
+        "decision": "approve",
+        "threshold": 0.5,
+        "cold_card": False,
+        "latency_ms": 1.0,
+    }
+    with (
+        patch("confluent_kafka.Consumer", lambda config: _FakeConsumer(messages, log)),
+        patch("src.pipeline.scorer.get_engine", return_value=MagicMock()),
+        patch("src.pipeline.scorer.score_event", return_value=score_response),
+        patch("src.pipeline.scorer.flush", side_effect=fake_flush),
+    ):
+        scored = scorer.run(max_events=60)
+
+    assert scored == 60
+    assert log == ["flush", "commit", "flush", "commit", "close"]
