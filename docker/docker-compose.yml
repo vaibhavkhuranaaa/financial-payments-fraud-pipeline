@@ -23,7 +23,7 @@ x-pipeline-env: &pipeline-env
 
 services:
   redpanda:
-    image: redpandadata/redpanda:latest
+    image: redpandadata/redpanda:v24.2.4
     container_name: redpanda
     command:
       - redpanda
@@ -34,7 +34,6 @@ services:
       - --check=false
       - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
       - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
-      - --set=redpanda.auto_create_topics_enabled=true
     ports:
       - "19092:19092"
     healthcheck:
