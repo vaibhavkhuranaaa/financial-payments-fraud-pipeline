@@ -1,4 +1,4 @@
-.PHONY: check lint test dbt-build tf-validate compose-validate fmt demo demo-down demo-down-volumes
+.PHONY: check lint test dbt-build tf-validate compose-validate fmt demo demo-cdc demo-down demo-down-volumes
 
 VENV := .venv/bin
 COMPOSE_FILE := docker/docker-compose.yml
@@ -29,12 +29,18 @@ compose-validate:
 demo:
 	bash scripts/demo.sh
 
+# v1.2 CDC-mode demo: bank.card_transactions is the system of record,
+# Debezium streams its change feed onto Kafka, cdc-transformer maps it back
+# onto contract-v1 — see scripts/demo.sh.
+demo-cdc:
+	CDC=1 bash scripts/demo.sh
+
 # Tear down the demo stack (containers only — named volumes, e.g. the bank
 # DB's data, persist so re-running `make demo` is fast on a warm cache).
 demo-down:
-	docker compose -f $(COMPOSE_FILE) --profile demo --profile replay down
+	docker compose -f $(COMPOSE_FILE) --profile demo --profile replay --profile cdc down
 
 # Same as demo-down but also drops named volumes (bank-db-data) for a fully
 # clean-state re-test.
 demo-down-volumes:
-	docker compose -f $(COMPOSE_FILE) --profile demo --profile replay down -v
+	docker compose -f $(COMPOSE_FILE) --profile demo --profile replay --profile cdc down -v

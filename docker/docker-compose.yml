@@ -215,8 +215,9 @@ services:
   # --- Ticket 11 (v1.2) CDC ingestion, profile "cdc" -----------------------
   # Alternative to the "replay"-onto-Kafka path: transactions are INSERTed
   # into bank.card_transactions (init-cdc + cdc-scan enable/pump CDC on it),
-  # and a later chunk of ticket 11 will add a `debezium/connect` service to
-  # this same profile to stream the resulting change table onto Kafka.
+  # Debezium (`connect` + `connect-init`) streams the resulting change table
+  # onto Kafka, and `cdc-transformer` maps the Debezium envelope back onto
+  # contract-v1 so the Spark features job / scorer / API need zero changes.
 
   # One-shot: enable CDC on the bank DB + bank.card_transactions, then exit.
   init-cdc:
@@ -276,6 +277,74 @@ services:
         condition: service_completed_successfully
     volumes:
       - ../data:/app/data
+
+  # Kafka Connect running the Debezium SQL Server source connector. Quay's
+  # image is used (not Docker Hub's `debezium/connect`, whose tags are dead)
+  # — verified to start on ARM against this compose's `redpanda` broker and
+  # ship io.debezium.connector.sqlserver.SqlServerConnector. JVM start is
+  # slow, hence the generous start_period.
+  connect:
+    image: quay.io/debezium/connect:2.7
+    container_name: connect
+    profiles: ["cdc"]
+    environment:
+      BOOTSTRAP_SERVERS: redpanda:9092
+      GROUP_ID: fraud-connect
+      CONFIG_STORAGE_TOPIC: _connect_config
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_status
+    ports:
+      - "8083:8083"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      bank-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  # One-shot: idempotently PUT the Debezium connector config (see
+  # docker/connect/bankdb-source.json) to Connect's REST API.
+  connect-init:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pipeline
+    container_name: connect-init
+    profiles: ["cdc"]
+    command: ["src.pipeline.connect_register"]
+    environment:
+      CONNECT_URL: http://connect:8083
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+    depends_on:
+      connect:
+        condition: service_healthy
+      init-cdc:
+        condition: service_completed_successfully
+    volumes:
+      - ../docker/connect:/app/docker/connect
+
+  # Transforms the Debezium change topic (bankdb.frauddemo.bank.card_transactions)
+  # back onto contract-v1 `transactions`, so the Spark features job / scorer
+  # / API downstream need zero changes between "replay" and "cdc" modes.
+  cdc-transformer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pipeline
+    container_name: cdc-transformer
+    profiles: ["cdc"]
+    command: ["src.pipeline.cdc_transformer"]
+    environment:
+      <<: *pipeline-env
+      KAFKA_TOPIC_CDC: ${KAFKA_TOPIC_CDC:-bankdb.frauddemo.bank.card_transactions}
+    depends_on:
+      connect-init:
+        condition: service_completed_successfully
+      redpanda:
+        condition: service_healthy
 
 volumes:
   bank-db-data:
