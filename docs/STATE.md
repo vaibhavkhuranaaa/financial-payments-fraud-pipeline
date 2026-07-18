@@ -31,8 +31,16 @@ Full plan: `~/.claude/plans/review-the-repository-plan-frolicking-gem.md` (local
 - **v1.0 COMPLETE (2026-07-17). Nothing in flight.** All Definition-of-Done boxes checked; local stack still runs via compose (see README). Streaming sink was rewritten during Phase 5 E2E (v2 windows broke the Spark sliding-window design — see commit "v2-compatible streaming sink" and features.py module docstring). Known accepted gaps are in README "What I'd Improve Next".
 - **v2 model iteration COMPLETE (2026-07-17):** `wip/model-iteration-v2` merged to main (merge commit 02f2fe4). API `/score` now builds its vector via the shared `build_feature_row` (skew rule); all 45 tests + `make check` green. README Key Results filled from the v2 full-data run (PR-AUC 0.0227, ROC-AUC 0.768, precision@top-0.1% 0.045); README/data-dictionary/tokenization-policy updated to 1h/1d/7d/30d windows. AI co-author trailers stripped from all local history (filter-branch + reflog expire + gc; verified zero). Retrain command if ever needed: `.venv/bin/python -m src.pipeline.train --input data/raw/card_transaction.v1.csv --since-year 2013 --until-year 2019` (~12 min).
 
-## Next step (exact resume sequence)
-None — v1.0 shipped. If resuming for v1.1+: candidates are in README "What I'd Improve Next" (feature-drift detection, idempotent foreachBatch Redis writes, dbt-on-Databricks staging). Redeploy any time with `infra/terraform/deploy.sh`; remember `destroy.sh` after demoing.
+## Next step (exact resume sequence) — v1.1 build approved 2026-07-17
+Approved plan: recruiter-ready demo — Azure SQL Edge system-of-record + live scorer loop + Plotly Dash fraud-ops dashboard + `make demo`. Full plan mirrored in tickets; costs: local $0, optional Azure demo-day ~$1.50–2.50/day (ask user before any `terraform apply`, ~$2–3 one-off).
+
+1. Execute `docs/tickets/06-bank-db.md` → `07-scorer-loop.md` + `08-dashboard.md` (parallelizable after 06) → `09-demo-infra-ci.md` → `10-docs-tests.md`, each via a **Sonnet subagent** (self-contained specs; orchestrator reviews diffs + runs gates, fixes seams inline).
+2. Verify per plan: `make demo` from clean state (dashboard :8050, alerts flowing, zero manual steps), kill-redis degradation visible, `make check` green.
+3. Tag `v1.1`, push (history is clean — no AI trailers, keep it that way).
+4. Orchestration rules: auto-edit /goal mode, don't stop until done; at 95% session usage write `docs/HANDOFF.md` + update this file + exact follow-up prompt, commit green first.
+
+Fresh-session follow prompt:
+> Continue the fraud pipeline v1.1 build. Read docs/STATE.md and docs/tickets/06–10, execute in order with Sonnet subagents per the orchestration notes, /goal mode, auto-edit, handoff at 95%.
 
 ## Environment facts
 - macOS (darwin 25.5), system Python 3.14 (too new for PySpark → use uv-managed 3.11 venv at `.venv/`)
