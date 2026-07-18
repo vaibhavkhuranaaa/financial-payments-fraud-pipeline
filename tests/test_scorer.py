@@ -317,3 +317,72 @@ def test_run_commits_offsets_only_after_sql_flush() -> None:
 
     assert scored == 60
     assert log == ["flush", "commit", "flush", "commit", "close"]
+
+
+class _IdleDone(Exception):
+    """Raised by _IdleConsumer to end run()'s otherwise-infinite idle loop."""
+
+
+class _IdleConsumer(_FakeConsumer):
+    """Serves its messages, then idles (poll -> None). Once the idle-path
+    flush has happened, raises _IdleDone so the test can exit run()."""
+
+    _idle_polls = 0
+
+    def poll(self, timeout: float) -> _FakeMessage | None:
+        if self._messages:
+            return self._messages.pop(0)
+        # End after the idle-path flush — or after a bounded number of idle
+        # polls, so a regression fails the assertions instead of hanging.
+        self._idle_polls += 1
+        if "flush" in self._log or self._idle_polls > 100:
+            raise _IdleDone
+        return None
+
+
+def test_run_flushes_subbatch_tail_on_idle_poll() -> None:
+    """An idle stream must not strand a sub-batch tail: once the buffer's
+    time threshold passes, a None poll flushes and commits it — messages
+    alone never reach BATCH_SIZE here, so only the idle path can flush."""
+    import json as _json
+
+    log: list[str] = []
+    payload = _json.dumps(EVENT).encode("utf-8")
+    # 3 messages (< BATCH_SIZE=50), then idle. should_flush() goes true only
+    # via the buffer's (patched, immediate) time threshold on an idle poll.
+    messages = [_FakeMessage(payload) for _ in range(3)]
+
+    def fake_flush(engine, buffer) -> None:  # noqa: ANN001 — patch target
+        log.append("flush")
+        buffer.mark_flushed()
+
+    score_response = {
+        "fraud_probability": 0.1,
+        "decision": "approve",
+        "threshold": 0.5,
+        "cold_card": False,
+        "latency_ms": 1.0,
+    }
+    calls: list[int] = []
+
+    def timed_should_flush(self) -> bool:  # noqa: ANN001 — patch target
+        # False for the 3 in-message checks, True from the first idle check.
+        calls.append(1)
+        return bool(self.scored_rows) and len(calls) > 3
+
+    with (
+        patch("confluent_kafka.Consumer", lambda config: _IdleConsumer(messages, log)),
+        patch("src.pipeline.scorer.get_engine", return_value=MagicMock()),
+        patch("src.pipeline.scorer.score_event", return_value=score_response),
+        patch("src.pipeline.scorer.flush", side_effect=fake_flush),
+        patch.object(scorer.ScoreBuffer, "should_flush", timed_should_flush),
+        pytest.raises(_IdleDone),
+    ):
+        scorer.run(max_events=None)
+
+    # The idle poll flushed the 3-row tail and paired it with a commit;
+    # shutdown (finally) found an empty buffer, committed offsets, closed.
+    assert log[0] == "flush"
+    assert log[1] == "commit"
+    assert log[-1] == "close"
+    assert log.count("flush") == 1

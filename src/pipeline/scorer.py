@@ -311,6 +311,12 @@ def run(max_events: int | None) -> int:
         while max_events is None or consumed < max_events:
             msg = consumer.poll(1.0)
             if msg is None:
+                # Idle stream: flush the sub-batch tail once the time
+                # threshold passes, or it would sit buffered (and its offsets
+                # uncommitted) until the next message arrives.
+                if buffer.should_flush():
+                    flush(engine, buffer)
+                    _commit_offsets(consumer)
                 continue
             if msg.error():
                 logger.warning("kafka consumer error: %s", msg.error())
