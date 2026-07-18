@@ -160,5 +160,57 @@ services:
     volumes:
       - ../data:/app/data
 
+  # Live scorer loop (ticket 07): consumes `transactions`, POSTs each event to
+  # the api's /score, writes bank.scored_transactions/fraud_alerts. Closes the
+  # demo loop so the dashboard (ticket 08) goes live with zero manual steps.
+  scorer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pipeline
+    container_name: scorer
+    profiles: ["demo"]
+    command: ["src.pipeline.scorer"]
+    environment:
+      <<: *pipeline-env
+      SCORE_URL: ${SCORE_URL:-http://api:8000/score}
+      ALERT_THRESHOLD: ${ALERT_THRESHOLD:-}
+      SCORER_MAX_EVENTS: ${SCORER_MAX_EVENTS:-}
+      BANK_DB_HOST: bank-db
+      BANK_DB_PORT: 1433
+      BANK_DB_USER: sa
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_NAME: ${BANK_DB_NAME:-master}
+    depends_on:
+      api:
+        condition: service_started
+      bank-db:
+        condition: service_healthy
+      init-bank:
+        condition: service_completed_successfully
+
+  # Fraud-ops dashboard (ticket 08): Plotly Dash, reads bank-db + api's
+  # /metrics + models/metrics.json. API is a soft dependency (metrics tile
+  # just shows a waiting state if it's down), so only bank-db is a hard
+  # `depends_on` condition.
+  dashboard:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.dashboard
+    container_name: dashboard
+    profiles: ["demo"]
+    ports:
+      - "${DASHBOARD_PORT:-8050}:8050"
+    environment:
+      BANK_DB_HOST: bank-db
+      BANK_DB_PORT: 1433
+      BANK_DB_USER: sa
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_NAME: ${BANK_DB_NAME:-master}
+      API_METRICS_URL: ${API_METRICS_URL:-http://api:8000/metrics}
+      DASHBOARD_PORT: ${DASHBOARD_PORT:-8050}
+    depends_on:
+      bank-db:
+        condition: service_healthy
+
 volumes:
   bank-db-data:

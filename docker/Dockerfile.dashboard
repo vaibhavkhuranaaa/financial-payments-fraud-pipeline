@@ -1,0 +1,39 @@
+# Plotly Dash fraud-ops dashboard — minimal image, dashboard-only deps
+# (no pyspark/delta-spark/confluent-kafka; mirrors Dockerfile.api's approach
+# of installing only the subset of requirements.txt this service needs).
+FROM python:3.11-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl freetds-bin \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid 1000 appuser \
+    && useradd --uid 1000 --gid appuser --shell /usr/sbin/nologin --create-home appuser
+
+WORKDIR /app
+
+# Install only the dashboard-needed subset of requirements.txt.
+RUN pip install --no-cache-dir \
+    dash==2.18.2 \
+    plotly==5.24.1 \
+    pandas==2.2.2 \
+    sqlalchemy==2.0.51 \
+    pymssql==2.3.13 \
+    requests==2.32.3 \
+    python-dotenv==1.0.1
+
+COPY src/bank/ /app/src/bank/
+COPY src/dashboard/ /app/src/dashboard/
+COPY models/metrics.json /app/models/metrics.json
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8050
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8050/ || exit 1
+
+CMD ["python", "-m", "src.dashboard.app"]
