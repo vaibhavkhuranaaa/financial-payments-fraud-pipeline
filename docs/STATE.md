@@ -42,6 +42,10 @@ Approved plan: recruiter-ready demo — Azure SQL Edge system-of-record + live s
 Fresh-session follow prompt:
 > Continue the fraud pipeline v1.1 build. Read docs/STATE.md and docs/tickets/06–10, execute in order with Sonnet subagents per the orchestration notes, /goal mode, auto-edit, handoff at 95%.
 
+## Backlog (approved direction, post-v1.1)
+- **v1.2 = CDC ingestion** (`docs/tickets/11-cdc-ingestion.md`): Debezium bank-DB→Kafka replaces CSV replay as the headline; do not start before v1.1 tags.
+- **v1.3 candidate = dual auth/settlement streams** (`docs/tickets/12-dual-stream.md`): stub only, needs design pass + user approval. Graph/ring features explicitly rejected.
+
 ## Environment facts
 - macOS (darwin 25.5), system Python 3.14 (too new for PySpark → use uv-managed 3.11 venv at `.venv/`)
 - Azure CLI logged in; subscription `278f1d2f-c561-4a57-ae32-0a5062f7e6b9`
