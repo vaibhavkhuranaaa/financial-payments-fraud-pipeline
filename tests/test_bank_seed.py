@@ -132,8 +132,11 @@ def test_run_script_splits_on_go_and_executes_each_batch() -> None:
     assert mock_conn.execute.call_count == 2
 
 
+@patch("src.bank.seed.bootstrap_database")
 @patch("src.bank.seed.get_engine")
-def test_seed_cli_entrypoint_applies_schema_and_writes_dims(mock_get_engine: MagicMock) -> None:
+def test_seed_cli_entrypoint_applies_schema_and_writes_dims(
+    mock_get_engine: MagicMock, mock_bootstrap: MagicMock
+) -> None:
     from src.bank import seed as seed_module
 
     mock_engine = MagicMock()
@@ -147,6 +150,9 @@ def test_seed_cli_entrypoint_applies_schema_and_writes_dims(mock_get_engine: Mag
     assert len(data.customers) > 0
     # apply_schema + write_dims both ran a transaction against the mock engine
     assert mock_engine.begin.call_count >= 2
+    # seed() must provision the database first (hermetically mocked here —
+    # the real bootstrap opens its own AUTOCOMMIT connection to master)
+    mock_bootstrap.assert_called_once()
 
 
 def test_schema_sql_guards_every_table_with_if_not_exists() -> None:
