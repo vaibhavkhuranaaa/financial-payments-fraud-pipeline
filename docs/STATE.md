@@ -51,6 +51,7 @@ Fresh-session follow prompt:
 
 ## Backlog (approved direction, post-v1.1)
 - **v1.2 = CDC ingestion** (`docs/tickets/11-cdc-ingestion.md`): now unblocked (v1.1 tagged) — see Next step above.
+- **Industry-grade hardening roadmap** (2026-07-18, 7 items in impact order): `docs/HANDOFF.md` — delivery semantics, schema registry, observability (Grafana/OTel/consumer lag), secrets hardening, load testing, model ops, CI/CD depth.
 - **v1.3 candidate = dual auth/settlement streams** (`docs/tickets/12-dual-stream.md`): stub only, needs design pass + user approval. Graph/ring features explicitly rejected.
 
 ## Environment facts
