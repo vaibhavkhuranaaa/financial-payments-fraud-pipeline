@@ -54,18 +54,16 @@ Trained on the full dataset (11.9M rows, 2013–2019, time-based train/valid/tes
 
 At a ~0.13% base rate, absolute precision is inherently low at any recall-bearing threshold; the ranking metrics (PR-AUC, precision@top-k) are the honest measure, and both improved ~8–34× over the v1 feature set after root-causing the near-empty 1m/10m/1h windows (TabFormer cards transact roughly daily).
 
-### API latency (cold-path baseline, local)
+### API latency (local, measured with `scripts/benchmark.py`)
 
-Measured with `scripts/benchmark.py` against the local Flask `/score` endpoint, n=500 requests, concurrency=4, **no Redis warm cache** (every card is a cold-start lookup — this is the conservative baseline, not the steady-state number):
+Two scenarios against the Dockerized Flask `/score` endpoint. **Warm** is the representative steady-state number: the full compose stack running, every benchmark card's `features:*` hash populated in Redis by the streaming job, so each request pays the real feature-join + model-predict path. **Cold** is the conservative baseline where every card misses Redis (zero-history fallback).
 
-| Metric | Value |
-|---|---|
-| Throughput | 1,884 req/s |
-| p50 | 1.87 ms |
-| p95 | 2.25 ms |
-| p99 | 9.90 ms |
+| Scenario | n | conc. | Throughput | p50 | p95 | p99 | errors |
+|---|---|---|---|---|---|---|---|
+| Warm Redis (steady state) | 2,000 | 8 | 1,237 req/s | 6.26 ms | 7.67 ms | 10.84 ms | 0 |
+| Cold (no online features) | 500 | 4 | 1,884 req/s | 1.87 ms | 2.25 ms | 9.90 ms | 0 |
 
-A warm-Redis benchmark (representative of steady-state production traffic, where most cards have recent online features already cached) is planned for Phase 5 and will replace/augment this table; until then treat the above as an upper bound on latency, not a lower one.
+Both are single-container Flask+gunicorn on a laptop (Colima VM) — comfortably inside a ~50ms authorization budget with headroom for network hops.
 
 ## How to Run Locally
 
@@ -79,10 +77,13 @@ python scripts/get_data.py --all   # optional if you only need the committed sam
 # 2. Bring up the core stack: Redpanda (Kafka), Redis, Spark streaming job, API
 docker compose -f docker/docker-compose.yml up --build
 
-# 3. In a second terminal, replay the sample CSV onto Kafka (opt-in profile)
+# 3. Create the topics (first run only — rpk in current images has no auto-create flag)
+docker exec redpanda rpk topic create transactions transactions.dlq
+
+# 4. In a second terminal, replay the sample CSV onto Kafka (opt-in profile)
 docker compose -f docker/docker-compose.yml --profile replay up producer
 
-# 4. Score a transaction
+# 5. Score a transaction
 curl -X POST http://localhost:8000/score -H 'Content-Type: application/json' -d '{...}'
 ```
 
