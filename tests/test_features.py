@@ -360,3 +360,49 @@ def test_vectorized_matches_row_wise_on_sample(tmp_path) -> None:
         row_values = df_row[col].to_numpy(dtype=float)
         vec_values = df_vec[col].to_numpy(dtype=float)
         assert np.allclose(row_values, vec_values, atol=1e-6), f"mismatch in column {col}"
+
+
+def test_latest_card_feature_mappings_includes_all_history_inclusively() -> None:
+    """The online hash for a card must aggregate every event up to AND
+    including its latest one (it's the state the NEXT authorization is scored
+    against), and last_event_ts must be the latest event's epoch seconds."""
+    from src.pipeline.features import latest_card_feature_mappings
+
+    history = pd.DataFrame(
+        {
+            "card_token": ["cardA", "cardA", "cardA", "cardB"],
+            "event_time": pd.to_datetime(
+                [
+                    "2019-06-01 12:00:00",
+                    "2019-06-01 13:00:00",
+                    "2019-06-20 09:00:00",
+                    "2019-06-05 10:00:00",
+                ]
+            ),
+            "amount": [10.0, 30.0, 60.0, 5.0],
+            "merchant_city": ["Tucson", "Tucson", "Phoenix", "Yuma"],
+            "has_error": [False, True, False, False],
+        }
+    )
+    out = latest_card_feature_mappings(history).set_index("card_token")
+
+    a = out.loc["cardA"]
+    # 30d window ending at 06-20 09:00 covers all three cardA events.
+    assert a["txn_count_30d"] == 3.0
+    assert a["amount_sum_30d"] == pytest.approx(100.0)
+    assert a["amount_mean_30d"] == pytest.approx(100.0 / 3)
+    assert a["distinct_merchant_city_30d"] == 2.0
+    assert a["decline_rate_30d"] == pytest.approx(1 / 3)
+    # 1d/1h/7d windows ending at the last event exclude the two June 1 events.
+    assert a["txn_count_7d"] == 1.0
+    assert a["txn_count_1d"] == 1.0
+    assert a["txn_count_1h"] == 1.0
+    assert a["amount_sum_1h"] == pytest.approx(60.0)
+    assert a["last_event_ts"] == pytest.approx(
+        pd.Timestamp("2019-06-20 09:00:00", tz="UTC").timestamp()
+    )
+
+    b = out.loc["cardB"]
+    assert b["txn_count_30d"] == 1.0
+    assert b["amount_sum_30d"] == pytest.approx(5.0)
+    assert b["decline_rate_30d"] == 0.0

@@ -42,23 +42,24 @@ external dependencies as Kafka (read) + Delta + Redis (write), with no second
 Kafka producer needed inside `foreachBatch`, and gives the quarantine table
 the same time-travel/audit properties as the rest of the lake.
 
-Valid events are watermarked 10 minutes on ``event_time``, aggregated over
-sliding windows per ``CARD_WINDOWS``, and in `foreachBatch`:
+Valid events are appended to Delta ``{DELTA_ROOT}/events``, and then — per
+microbatch, in `foreachBatch` — each affected card's trailing-30d Delta
+history is replayed through the SAME vectorized feature code the offline
+trainer uses (``latest_card_feature_mappings`` →
+``compute_card_features_vectorized``, the skew rule), producing that card's
+current online feature hash, which is:
   * upserted into the Redis hash ``features:{card_token}`` (online store), and
-  * appended to Delta tables ``{DELTA_ROOT}/events`` (raw enriched events) and
-    ``{DELTA_ROOT}/card_features`` (windowed aggregates), for offline reuse.
+  * appended to Delta ``{DELTA_ROOT}/card_features`` for offline reuse.
 
-``time_since_last_txn_s`` and ``is_new_city_30d`` are NOT bucket aggregates —
-they're inherently sequential per-card state (see
-``_update_sequential_card_state``'s docstring), so the streaming job
-maintains them via a bounded per-microbatch pandas pass seeded from the
-PRE-BATCH Redis state (``features:{card_token}["last_event_ts"]`` and a
-``cities_30d:{card_token}`` Redis SET with TTL-based approximate pruning),
-rather than a Spark window aggregation. This is documented as an
-approximation relative to the EXACT point-in-time computation the offline
-trainer uses (``compute_offline_card_features`` /
-``compute_card_features_vectorized``); it has not been exercised against a
-live cluster in this repo (v1 is local-training-only per ADR 0001).
+This is deliberately NOT a Spark sliding-window aggregation: v2 windows go
+up to 30 days, and ``F.window(duration, slide=30s)`` semantics would create
+tens of thousands of window instances per event. A microbatch is bounded and
+TabFormer has O(thousands) of cards, so the bounded driver-side pandas pass
+is the pragmatic `foreachBatch` escape hatch. ``time_since_last_txn_s`` and
+``amount_over_mean_30d`` are never stored — ``build_feature_row`` derives
+them at serving time from ``last_event_ts`` / ``amount_mean_30d`` in the
+hash. ``is_new_city_30d`` defaults to "new" online when absent (documented
+approximation; the offline trainer computes it exactly).
 """
 
 from __future__ import annotations
@@ -68,7 +69,7 @@ import math
 import os
 import sys
 from collections import Counter, deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
@@ -617,84 +618,44 @@ def _build_spark_session():
     return builder.getOrCreate()
 
 
-def _foreach_batch(batch_df, batch_id: int) -> None:  # pragma: no cover - exercised only with a live cluster
-    """Per-microbatch sink: upsert Redis online features + append Delta card_features."""
-    import redis
+def latest_card_feature_mappings(history_pdf: "pd.DataFrame") -> "pd.DataFrame":
+    """Given the (bounded) event history of a set of cards, return one row per
+    card holding the CURRENT online feature hash for that card: every
+    CARD_WINDOWS aggregate evaluated over the trailing window ending at (and
+    including) the card's most recent event, plus ``last_event_ts`` (epoch
+    seconds of that most recent event).
 
-    features_path = os.path.join(DELTA_ROOT, "card_features")
+    Required columns in `history_pdf`: card_token, event_time (datetime64,
+    tz-naive UTC), amount (float), merchant_city (str), has_error (bool).
 
-    window_cols = [c for w in CARD_WINDOWS for c in window_feature_names(w)]
-    feature_df = batch_df.select("card_token", "updated_at", *window_cols)
-    feature_df.write.format("delta").mode("append").save(features_path)
-
-    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-    rows = feature_df.collect()
-    pipe = r.pipeline()
-    for row in rows:
-        mapping = {c: row[c] for c in window_cols}
-        mapping["updated_at"] = row["updated_at"]
-        pipe.hset(f"features:{row['card_token']}", mapping=mapping)
-    pipe.execute()
-
-
-def _update_sequential_card_state(
-    events_pdf: "pd.DataFrame", redis_client: Any
-) -> "pd.DataFrame":  # pragma: no cover - exercised only with a live cluster
-    """Maintain the two genuinely SEQUENTIAL (not window-aggregate) pieces of
-    per-card state: `last_event_ts` and the trailing-30d city set backing
-    `is_new_city_30d`.
-
-    Why this lives here instead of in the groupBy+window aggregation below:
-    Spark's `F.window` aggregation produces one row per (window bucket, card)
-    — perfect for txn_count/amount_sum/mean/distinct_city/decline_rate, but
-    "seconds since the literal previous event" and "has this exact city been
-    seen in the trailing 30 days" are inherently per-event sequential state,
-    not bucket aggregates. A microbatch is bounded in size, so pulling just
-    the (card_token, event_ts, merchant_city) columns to the driver via
-    `foreachBatch` and walking each card's events in order — seeded from the
-    PRE-BATCH Redis state — is the standard escape hatch Structured
-    Streaming's `foreachBatch` exists for.
-
-    Approximation, documented: the 30d city set is pruned via a Redis TTL
-    refresh (`EXPIRE cities_30d:{card_token} 30d` on every touch) rather than
-    an exact per-city sliding eviction — a card whose city set hasn't
-    changed in 30 days keeps a slightly stale membership until its next
-    event. This is exact enough for a burst-detection/anomaly signal and is
-    NOT used by the offline trainer (which computes this exactly via
-    `compute_offline_card_features`/`compute_card_features_vectorized`).
-
-    Returns `events_pdf` with two added columns: `last_event_ts` (float,
-    seconds, may be NaN for a card's very first event ever) and
-    `is_new_city_30d` (0/1).
+    Train/serve-skew rule: the aggregate math is NOT reimplemented here — a
+    synthetic probe row is appended 1µs after each card's last event and the
+    whole frame is run through the SAME ``compute_card_features_vectorized``
+    the offline trainer uses; the probe rows' strictly-before-the-probe
+    features are exactly "every real event up to and including the latest",
+    i.e. the state the next incoming authorization should be scored against.
+    The probe's own amount/city/error values never contribute (a row never
+    contributes to its own features), so dummies are safe.
     """
     import pandas as pd
 
-    events_pdf = events_pdf.sort_values(["card_token", "event_ts"], kind="mergesort").reset_index(drop=True)
-    last_event_ts_col = pd.Series(index=events_pdf.index, dtype="float64")
-    is_new_city_col = pd.Series(index=events_pdf.index, dtype="int64")
+    last_ts = history_pdf.groupby("card_token", sort=False)["event_time"].max().reset_index()
+    probes = last_ts.copy()
+    probes["event_time"] = probes["event_time"] + pd.Timedelta(microseconds=1)
+    probes["amount"] = 0.0
+    probes["merchant_city"] = ""
+    probes["has_error"] = False
 
-    for card_token, group in events_pdf.groupby("card_token", sort=False):
-        prev_ts_raw = redis_client.hget(f"features:{card_token}", "last_event_ts")
-        prev_ts = float(prev_ts_raw) if prev_ts_raw not in (None, "") else None
-        cities_key = f"cities_30d:{card_token}"
-        seen_cities = set(redis_client.smembers(cities_key))
+    combined = pd.concat([history_pdf, probes], ignore_index=True)
+    feats = compute_card_features_vectorized(combined)
+    probe_feats = feats.iloc[len(history_pdf) :].reset_index(drop=True)
 
-        for idx, row in group.iterrows():
-            ts = row["event_ts"].timestamp()
-            city = row["merchant_city"]
-            last_event_ts_col.at[idx] = prev_ts if prev_ts is not None else float("nan")
-            is_new_city_col.at[idx] = 0 if city in seen_cities else 1
-            prev_ts = ts
-            seen_cities.add(city)
-
-        redis_client.hset(f"features:{card_token}", mapping={"last_event_ts": prev_ts})
-        if seen_cities:
-            redis_client.sadd(cities_key, *seen_cities)
-        redis_client.expire(cities_key, int(CARD_WINDOWS["30d"]))
-
-    events_pdf["last_event_ts"] = last_event_ts_col
-    events_pdf["is_new_city_30d"] = is_new_city_col
-    return events_pdf
+    window_cols = [c for w in CARD_WINDOWS for c in window_feature_names(w)]
+    out = last_ts[["card_token"]].copy()
+    for col in window_cols:
+        out[col] = probe_feats[col].to_numpy()
+    out["last_event_ts"] = last_ts["event_time"].astype("int64") / 1e9
+    return out
 
 
 def run_stream(once: bool = False) -> None:  # pragma: no cover - requires a live Kafka/Spark cluster
@@ -763,38 +724,61 @@ def run_stream(once: bool = False) -> None:  # pragma: no cover - requires a liv
                 .withColumn("updated_at", F.current_timestamp().cast("string"))
             )
 
-            windowed = enriched.withWatermark("event_ts", "10 minutes")
-            for window_key, seconds in CARD_WINDOWS.items():
-                agg = (
-                    windowed.groupBy(
-                        F.window("event_ts", f"{seconds} seconds", "30 seconds"),
-                        "card_token",
-                    )
-                    .agg(
-                        F.count("*").alias(f"txn_count_{window_key}"),
-                        F.sum("amount").alias(f"amount_sum_{window_key}"),
-                        F.avg("amount").alias(f"amount_mean_{window_key}"),
-                        F.countDistinct("merchant_city").alias(f"distinct_merchant_city_{window_key}"),
-                        (F.sum(F.when(F.col("errors").isNotNull(), 1).otherwise(0)) / F.count("*")).alias(
-                            f"decline_rate_{window_key}"
-                        ),
-                    )
-                    .withColumn("updated_at", F.current_timestamp().cast("string"))
+            events_path = os.path.join(DELTA_ROOT, "events")
+            enriched.write.format("delta").mode("append").save(events_path)
+
+            # Online per-card features: NOT a Spark sliding-window aggregation.
+            # v2 windows go up to 30 days — with F.window's slide semantics
+            # that's tens of thousands of window instances per event, which
+            # does not scale. Instead each microbatch replays the affected
+            # cards' trailing-30d Delta history through the SAME vectorized
+            # feature code the offline trainer uses (skew rule) and upserts
+            # each card's latest hash into Redis. A microbatch is bounded and
+            # TabFormer has O(thousands) of cards, so the driver-side pandas
+            # pass is bounded too. `amount_over_mean_30d`/`time_since_last_txn_s`
+            # are not stored: build_feature_row derives them at serving time
+            # from amount_mean_30d / last_event_ts.
+            batch_cards = [row["card_token"] for row in enriched.select("card_token").distinct().collect()]
+            # Bound the history read to what the 30d window can ever use. The
+            # cutoff is relative to the BATCH's event times (replayed data is
+            # historic), not the wall clock: any event older than (a card's
+            # last event - 30d) can't contribute, and every card's last event
+            # is >= this batch's minimum event time.
+            min_batch_ts = enriched.agg(F.min("event_ts")).collect()[0][0]
+            history_cutoff = min_batch_ts - timedelta(days=31)
+            history = (
+                spark.read.format("delta")
+                .load(events_path)
+                .filter(F.col("card_token").isin(batch_cards) & (F.col("event_ts") >= F.lit(history_cutoff)))
+                .select(
+                    "card_token",
+                    F.col("event_ts").alias("event_time"),
+                    "amount",
+                    "merchant_city",
+                    F.col("errors").isNotNull().alias("has_error"),
                 )
-                _foreach_batch(agg, batch_id)
+                .toPandas()
+            )
+            if getattr(history["event_time"].dtype, "tz", None) is not None:
+                history["event_time"] = history["event_time"].dt.tz_localize(None)
 
-            # Sequential per-card state (last_event_ts, is_new_city_30d) — see
-            # _update_sequential_card_state docstring for why this can't be a
-            # groupBy+window aggregate like the metrics above. `amount` here
-            # is not written to Redis at all: amount_over_mean_30d is derived
-            # at build_feature_row time from `amount_mean_30d` (already
-            # upserted above), the same "no extra Redis field" pattern as
-            # time_since_last_txn_s deriving from last_event_ts.
-            small_cols_pdf = enriched.select("card_token", "event_ts", "merchant_city").toPandas()
+            mappings = latest_card_feature_mappings(history)
+            updated_at = datetime.now(timezone.utc).isoformat()
+
             redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-            _update_sequential_card_state(small_cols_pdf, redis_client)
+            pipe = redis_client.pipeline()
+            for row in mappings.to_dict(orient="records"):
+                card_token = row.pop("card_token")
+                mapping = {key: float(value) for key, value in row.items()}
+                mapping["updated_at"] = updated_at
+                pipe.hset(f"features:{card_token}", mapping=mapping)
+            pipe.execute()
 
-            enriched.write.format("delta").mode("append").save(os.path.join(DELTA_ROOT, "events"))
+            features_pdf = mappings.copy()
+            features_pdf["updated_at"] = updated_at
+            spark.createDataFrame(features_pdf).write.format("delta").mode("append").save(
+                os.path.join(DELTA_ROOT, "card_features")
+            )
 
     query_builder = valid_df.union(invalid_df).writeStream.foreachBatch(sink_batch).outputMode("append")
     if once:
