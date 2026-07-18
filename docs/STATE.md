@@ -39,7 +39,11 @@ Full plan: `~/.claude/plans/review-the-repository-plan-frolicking-gem.md` (local
 - Docker via Colima (not Docker Desktop)
 
 ## Azure resources (record after `terraform apply`; needed for teardown)
-_None provisioned yet._
+Provisioned 2026-07-17 (prefix `fraudpl`, eastus2), verified live, then destroyed same day — see below:
+- RG `fraudpl-rg`: ACR `fraudplacr`, Event Hubs ns `fraudpl-ehns` (transactions, transactions-dlq), Log Analytics `fraudpl-law`, Container Apps env `fraudpl-cae`, app `fraudpl-api` (FQDN was fraudpl-api.redsmoke-f278091d.eastus2.azurecontainerapps.io)
+- One-time subscription fix that had to be applied: `az provider register --namespace Microsoft.App`
+- Live check: /healthz ok, /score 200 (server-side ~2.3ms); benchmark p50 147ms / p95 282ms / p99 290ms @ 21.8 req/s cross-internet
+- Teardown: `destroy.sh` run + `az group exists fraudpl-rg` = false (verify current state before assuming anything is running)
 
 ## Known issues
 _None yet._

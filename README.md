@@ -65,6 +65,8 @@ Two scenarios against the Dockerized Flask `/score` endpoint. **Warm** is the re
 
 Both are single-container Flask+gunicorn on a laptop (Colima VM) — comfortably inside a ~50ms authorization budget with headroom for network hops.
 
+Deployed to Azure Container Apps (eastus2, 0.5 vCPU / 1Gi), the same benchmark measured cross-internet from a laptop: p50 147 ms / p95 282 ms / p99 290 ms at 21.8 req/s, 0 errors — the server-side scoring path (reported per-response as `latency_ms`) stayed at ~2–3 ms, so the gap is network RTT + TLS to the region, not the pipeline. The deployment was verified live and then torn down (`destroy.sh`) to stop the ~$40/mo Event Hubs Standard + Container Apps spend; `deploy.sh` recreates it in ~15 minutes.
+
 ## How to Run Locally
 
 ```bash

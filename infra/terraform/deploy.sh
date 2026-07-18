@@ -48,6 +48,7 @@ echo "==> updating Container App to the freshly-built api image"
 az containerapp update \
   --name "$CONTAINER_APP_NAME" \
   --resource-group "$RESOURCE_GROUP" \
+  --container-name api \
   --image "$ACR_NAME.azurecr.io/fraud-api:latest"
 
 echo "==> done. API FQDN:"

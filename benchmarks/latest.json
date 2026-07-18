@@ -1,12 +1,12 @@
 {
-  "n": 2000,
-  "concurrency": 8,
-  "url": "http://localhost:8000/score",
-  "wall_seconds": 1.6168085419922136,
-  "throughput_rps": 1237.0048450731354,
+  "n": 500,
+  "concurrency": 4,
+  "url": "https://fraudpl-api.redsmoke-f278091d.eastus2.azurecontainerapps.io/score",
+  "wall_seconds": 22.930906459019752,
+  "throughput_rps": 21.804633013246086,
   "errors": 0,
-  "p50_ms": 6.2555629992857575,
-  "p95_ms": 7.665612860000692,
-  "p99_ms": 10.84331009129528,
-  "mean_ms": 6.437057581730187
+  "p50_ms": 147.29504199931398,
+  "p95_ms": 281.9129651907133,
+  "p99_ms": 290.0565538308001,
+  "mean_ms": 182.7200399421272
 }
