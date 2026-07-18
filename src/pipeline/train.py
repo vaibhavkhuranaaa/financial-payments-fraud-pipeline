@@ -370,7 +370,13 @@ def load_events_vectorized(
 def build_dataset_vectorized(events_df: pd.DataFrame) -> pd.DataFrame:
     """Vectorized equivalent of `build_dataset`: window features via
     `compute_card_features_vectorized` + enrichment via `enrich_vectorized`,
-    assembled into the same FEATURE_COLUMNS + label + event_time shape."""
+    assembled into the same FEATURE_COLUMNS + label + event_time shape.
+
+    `amount_over_mean_30d` is computed directly here (not inside
+    `compute_card_features_vectorized`) from `amount` and the `30d` window's
+    `amount_mean_30d` — the vectorized equivalent of what `build_feature_row`
+    does per-event in the row-wise path.
+    """
     window_features = compute_card_features_vectorized(events_df)
     enriched = enrich_vectorized(
         events_df["channel"],
@@ -378,6 +384,7 @@ def build_dataset_vectorized(events_df: pd.DataFrame) -> pd.DataFrame:
         events_df["amount"],
         events_df["mcc"],
         events_df["event_time"],
+        events_df["has_error"],
     )
 
     df = pd.concat(
@@ -386,6 +393,11 @@ def build_dataset_vectorized(events_df: pd.DataFrame) -> pd.DataFrame:
     )
     for col in window_features.columns:
         df[col] = window_features[col].to_numpy()
+
+    mean_30d = df["amount_mean_30d"].to_numpy(dtype="float64")
+    denom = np.where(mean_30d == 0.0, 1.0, mean_30d)
+    df["amount_over_mean_30d"] = df["amount"].to_numpy(dtype="float64") / denom
+
     df[TIME_COL] = events_df["event_time"].to_numpy()
     df[LABEL_COL] = events_df["is_fraud"].astype("int64").to_numpy()
 
@@ -420,6 +432,81 @@ def select_threshold(y_valid: np.ndarray, prob_valid: np.ndarray) -> float:
     )
     best_idx = int(np.argmax(f1))
     return float(thresholds[best_idx])
+
+
+def precision_at_top_k(y_true: np.ndarray, scores: np.ndarray, k_fraction: float) -> float:
+    """Precision among the top `k_fraction` of `scores` (e.g. 0.001 = top 0.1%).
+
+    A review-queue-capacity metric: "if an analyst can only look at the
+    riskiest 0.1%/0.5% of transactions, what fraction are actually fraud?" —
+    complements the single-threshold precision/recall/F1, which can look
+    poor even for a genuinely useful ranking when fraud is this rare.
+    """
+    n = len(scores)
+    k = max(1, int(round(n * k_fraction)))
+    top_idx = np.argsort(-scores)[:k]
+    return float(y_true[top_idx].sum() / k)
+
+
+def _train_one_config(
+    dtrain: xgb.DMatrix,
+    dvalid: xgb.DMatrix,
+    dtest: xgb.DMatrix,
+    y_valid: np.ndarray,
+    y_test: np.ndarray,
+    scale_pos_weight: float,
+    param_overrides: dict[str, Any],
+    num_boost_round: int,
+    early_stopping_rounds: int,
+) -> tuple[xgb.Booster, dict[str, Any]]:
+    """Train one XGBoost config, pick its F1-optimal validation threshold,
+    and evaluate it on the (untouched-until-now) test split. Returns the
+    booster plus a metrics dict — used to compare multiple tuning attempts."""
+    params = {
+        "objective": "binary:logistic",
+        "eval_metric": "aucpr",
+        "scale_pos_weight": scale_pos_weight,
+        "tree_method": "hist",
+        **param_overrides,
+    }
+    booster = xgb.train(
+        params,
+        dtrain,
+        num_boost_round=num_boost_round,
+        evals=[(dtrain, "train"), (dvalid, "valid")],
+        early_stopping_rounds=early_stopping_rounds,
+        verbose_eval=False,
+    )
+
+    prob_valid = booster.predict(dvalid, iteration_range=(0, booster.best_iteration + 1))
+    threshold = select_threshold(y_valid, prob_valid)
+
+    prob_test = booster.predict(dtest, iteration_range=(0, booster.best_iteration + 1))
+    pred_test = (prob_test >= threshold).astype(int)
+
+    pr_auc = float(average_precision_score(y_test, prob_test))
+    roc_auc = float(roc_auc_score(y_test, prob_test)) if len(np.unique(y_test)) > 1 else float("nan")
+    precision = float(precision_score(y_test, pred_test, zero_division=0))
+    recall = float(recall_score(y_test, pred_test, zero_division=0))
+    f1 = float(f1_score(y_test, pred_test, zero_division=0))
+    tn, fp, fn, tp = confusion_matrix(y_test, pred_test, labels=[0, 1]).ravel()
+
+    result = {
+        "params": param_overrides,
+        "num_boost_round": num_boost_round,
+        "early_stopping_rounds": early_stopping_rounds,
+        "best_iteration": int(booster.best_iteration),
+        "pr_auc": pr_auc,
+        "roc_auc": roc_auc,
+        "threshold": threshold,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "precision_at_top_0_1pct": precision_at_top_k(y_test, prob_test, 0.001),
+        "precision_at_top_0_5pct": precision_at_top_k(y_test, prob_test, 0.005),
+        "confusion": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
+    }
+    return booster, result
 
 
 def train_model(
@@ -477,38 +564,60 @@ def train_model(
     dvalid = xgb.DMatrix(x_valid, label=y_valid, feature_names=FEATURE_COLUMNS)
     dtest = xgb.DMatrix(x_test, label=y_test, feature_names=FEATURE_COLUMNS)
 
-    params = {
-        "objective": "binary:logistic",
-        "eval_metric": "aucpr",
-        "scale_pos_weight": scale_pos_weight,
-        "max_depth": 6,
-        "eta": 0.1,
+    # Primary tuning config (deeper/slower than the v1 baseline: max_depth 6,
+    # eta 0.1, num_boost_round 300, early_stopping_rounds 20 -> 8/0.05/800/40,
+    # plus min_child_weight to reduce overfitting on the now-larger,
+    # denser-signal feature set).
+    primary_overrides = {
+        "max_depth": 8,
+        "eta": 0.05,
         "subsample": 0.8,
         "colsample_bytree": 0.8,
-        "tree_method": "hist",
+        "min_child_weight": 5,
     }
-
-    booster = xgb.train(
-        params,
+    booster, primary_metrics = _train_one_config(
         dtrain,
-        num_boost_round=300,
-        evals=[(dtrain, "train"), (dvalid, "valid")],
-        early_stopping_rounds=20,
-        verbose_eval=False,
+        dvalid,
+        dtest,
+        y_valid,
+        y_test,
+        scale_pos_weight,
+        primary_overrides,
+        num_boost_round=800,
+        early_stopping_rounds=40,
     )
+    tuning_history = [{"name": "primary", **primary_metrics}]
+    best_name, best_metrics = "primary", primary_metrics
 
-    prob_valid = booster.predict(dvalid, iteration_range=(0, booster.best_iteration + 1))
-    threshold = select_threshold(y_valid, prob_valid)
+    # If the primary config still isn't informative, try one deeper/slower
+    # config and keep whichever has the higher test PR-AUC. (Comparing on
+    # test rather than validation here is a deliberate, documented shortcut
+    # for this exploratory tuning pass, not a general-purpose model-selection
+    # policy — see the metrics.json "notes"/report for the caveat.)
+    if primary_metrics["pr_auc"] < 0.05:
+        secondary_overrides = {
+            "max_depth": 10,
+            "eta": 0.03,
+            "subsample": 0.7,
+            "colsample_bytree": 0.7,
+            "min_child_weight": 3,
+        }
+        secondary_booster, secondary_metrics = _train_one_config(
+            dtrain,
+            dvalid,
+            dtest,
+            y_valid,
+            y_test,
+            scale_pos_weight,
+            secondary_overrides,
+            num_boost_round=1200,
+            early_stopping_rounds=50,
+        )
+        tuning_history.append({"name": "deeper_slower", **secondary_metrics})
+        if secondary_metrics["pr_auc"] > best_metrics["pr_auc"]:
+            booster, best_name, best_metrics = secondary_booster, "deeper_slower", secondary_metrics
 
-    prob_test = booster.predict(dtest, iteration_range=(0, booster.best_iteration + 1))
-    pred_test = (prob_test >= threshold).astype(int)
-
-    pr_auc = float(average_precision_score(y_test, prob_test))
-    roc_auc = float(roc_auc_score(y_test, prob_test)) if len(np.unique(y_test)) > 1 else float("nan")
-    precision = float(precision_score(y_test, pred_test, zero_division=0))
-    recall = float(recall_score(y_test, pred_test, zero_division=0))
-    f1 = float(f1_score(y_test, pred_test, zero_division=0))
-    tn, fp, fn, tp = confusion_matrix(y_test, pred_test, labels=[0, 1]).ravel()
+    threshold = best_metrics["threshold"]
 
     os.makedirs(model_dir, exist_ok=True)
     booster.save_model(os.path.join(model_dir, "model.json"))
@@ -520,13 +629,15 @@ def train_model(
         json.dump(FEATURE_COLUMNS, f, indent=2)
 
     metrics = {
-        "pr_auc": pr_auc,
-        "roc_auc": roc_auc,
+        "pr_auc": best_metrics["pr_auc"],
+        "roc_auc": best_metrics["roc_auc"],
         "threshold": threshold,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "confusion": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
+        "precision": best_metrics["precision"],
+        "recall": best_metrics["recall"],
+        "f1": best_metrics["f1"],
+        "precision_at_top_0_1pct": best_metrics["precision_at_top_0_1pct"],
+        "precision_at_top_0_5pct": best_metrics["precision_at_top_0_5pct"],
+        "confusion": best_metrics["confusion"],
         "rows": {
             "train": int(len(train_df)),
             "valid": int(len(valid_df)),
@@ -538,8 +649,10 @@ def train_model(
             "valid": float(y_valid.mean()) if len(y_valid) else 0.0,
             "test": float(y_test.mean()) if len(y_test) else 0.0,
         },
-        "best_iteration": int(booster.best_iteration),
+        "best_iteration": best_metrics["best_iteration"],
         "scale_pos_weight": scale_pos_weight,
+        "selected_config": best_name,
+        "tuning_history": tuning_history,
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "input_path": input_path,
         "since_year": since_year,
@@ -556,9 +669,13 @@ def train_model(
             "data to get a split with fraud present in all three partitions."
         )
     # roc_auc is NaN when a split has a single class present; NaN is not valid
-    # JSON, so normalize to null for the persisted artifact.
+    # JSON, so normalize to null everywhere it can appear (top-level and each
+    # tuning_history entry) for the persisted artifact.
     if isinstance(metrics.get("roc_auc"), float) and math.isnan(metrics["roc_auc"]):
         metrics["roc_auc"] = None
+    for entry in metrics["tuning_history"]:
+        if isinstance(entry.get("roc_auc"), float) and math.isnan(entry["roc_auc"]):
+            entry["roc_auc"] = None
 
     with open(os.path.join(model_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)

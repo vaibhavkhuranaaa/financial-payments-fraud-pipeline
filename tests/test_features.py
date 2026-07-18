@@ -95,6 +95,29 @@ def test_enrich_amount_log_and_time_parts() -> None:
     assert result["day_of_week"] == 5  # Saturday, 2019-06-01
 
 
+def test_enrich_channel_one_hots() -> None:
+    """is_chip/is_swipe are one-hots alongside is_cnp; exactly one is true."""
+    chip = enrich(_event(channel="chip"))
+    assert (chip["is_cnp"], chip["is_chip"], chip["is_swipe"]) == (False, True, False)
+    swipe = enrich(_event(channel="swipe"))
+    assert (swipe["is_cnp"], swipe["is_chip"], swipe["is_swipe"]) == (False, False, True)
+    online = enrich(_event(channel="online"))
+    assert (online["is_cnp"], online["is_chip"], online["is_swipe"]) == (True, False, False)
+
+
+def test_enrich_has_error_flag() -> None:
+    assert enrich(_event(errors=None))["has_error"] is False
+    assert enrich(_event(errors=""))["has_error"] is False
+    assert enrich(_event(errors="Bad CVV"))["has_error"] is True
+
+
+def test_enrich_mcc_passthrough() -> None:
+    """Raw mcc is exposed directly (not just the grouped mcc_group_id) — high-
+    cardinality ints are fine for tree-based splits."""
+    assert enrich(_event(mcc=5411))["mcc"] == 5411
+    assert enrich(_event(mcc=4511))["mcc"] == 4511
+
+
 def test_window_feature_names_cover_all_windows() -> None:
     for window_key in CARD_WINDOWS:
         names = window_feature_names(window_key)
@@ -112,15 +135,29 @@ def test_feature_columns_match_enrichment_and_windows() -> None:
         "amount",
         "amount_log",
         "is_cnp",
+        "is_chip",
+        "is_swipe",
         "is_cross_border",
         "mcc_group_id",
+        "mcc",
+        "has_error",
         "hour_of_day",
         "day_of_week",
+        "time_since_last_txn_s",
+        "is_new_city_30d",
+        "amount_over_mean_30d",
     }
     assert expected_event_level.issubset(set(FEATURE_COLUMNS))
     for window_key in CARD_WINDOWS:
         for name in window_feature_names(window_key):
             assert name in FEATURE_COLUMNS
+
+
+def test_card_windows_are_the_density_tuned_set() -> None:
+    """TabFormer cards transact roughly daily, so sub-hour windows are almost
+    always empty; regressing back to 1m/10m/1h would silently reintroduce
+    that near-uninformative feature set. 1h is kept for burst detection."""
+    assert CARD_WINDOWS == {"1h": 3600, "1d": 86400, "7d": 604800, "30d": 2592000}
 
 
 def test_leakage_safety_three_event_toy_history() -> None:
@@ -133,33 +170,101 @@ def test_leakage_safety_three_event_toy_history() -> None:
     features = compute_offline_card_features(events)
 
     # First event in the card's history has no prior events at all.
-    assert features[0]["txn_count_1m"] == 0.0
-    assert features[0]["amount_sum_1m"] == 0.0
-    assert features[0]["distinct_merchant_city_1m"] == 0.0
+    assert features[0]["txn_count_1h"] == 0.0
+    assert features[0]["amount_sum_1h"] == 0.0
+    assert features[0]["distinct_merchant_city_1h"] == 0.0
 
-    # Second event's 1m-window features reflect ONLY the first event, never itself.
-    assert features[1]["txn_count_1m"] == 1.0
-    assert features[1]["amount_sum_1m"] == 10.0
-    assert features[1]["distinct_merchant_city_1m"] == 1.0
+    # Second event's 1h-window features reflect ONLY the first event, never itself.
+    assert features[1]["txn_count_1h"] == 1.0
+    assert features[1]["amount_sum_1h"] == 10.0
+    assert features[1]["distinct_merchant_city_1h"] == 1.0
 
     # Third event reflects the first two, not itself (amount 30 excluded from sum).
-    assert features[2]["txn_count_1m"] == 2.0
-    assert features[2]["amount_sum_1m"] == 30.0  # 10 + 20, NOT +30
-    assert features[2]["distinct_merchant_city_1m"] == 2.0  # A, B — not C
+    assert features[2]["txn_count_1h"] == 2.0
+    assert features[2]["amount_sum_1h"] == 30.0  # 10 + 20, NOT +30
+    assert features[2]["distinct_merchant_city_1h"] == 2.0  # A, B — not C
 
 
 def test_leakage_safety_respects_window_eviction() -> None:
     """Events older than the window size must drop out of the aggregate."""
     events = [
         _event(event_time="2019-06-01T12:00:00Z", amount=10.0),
-        _event(event_time="2019-06-01T12:02:00Z", amount=20.0),  # 2 min later, outside 1m window
+        _event(event_time="2019-06-01T14:00:00Z", amount=20.0),  # 2h later, outside 1h window
     ]
     features = compute_offline_card_features(events)
-    assert features[1]["txn_count_1m"] == 0.0
-    assert features[1]["amount_sum_1m"] == 0.0
-    # But the 10m/1h windows still include the first event.
-    assert features[1]["txn_count_10m"] == 1.0
-    assert features[1]["amount_sum_10m"] == 10.0
+    assert features[1]["txn_count_1h"] == 0.0
+    assert features[1]["amount_sum_1h"] == 0.0
+    # But the 1d/7d/30d windows still include the first event.
+    assert features[1]["txn_count_1d"] == 1.0
+    assert features[1]["amount_sum_1d"] == 10.0
+
+
+def test_time_since_last_txn_s_first_event_is_capped() -> None:
+    """A card's first-ever event has no history: time_since_last_txn_s must
+    be the 30d cap, not 0 or some other sentinel that could look like 'very
+    recent activity' to the model."""
+    event = _event(event_time="2019-06-01T12:00:00Z")
+    window_features = compute_offline_card_features([event])[0]
+    row = build_feature_row(event, window_features)
+    assert row["time_since_last_txn_s"] == float(CARD_WINDOWS["30d"])
+    assert row["is_new_city_30d"] == 1
+
+
+def test_time_since_last_txn_s_matches_actual_gap() -> None:
+    events = [
+        _event(event_time="2019-06-01T12:00:00Z"),
+        _event(event_time="2019-06-01T12:05:00Z"),  # 300s later
+    ]
+    window_features = compute_offline_card_features(events)
+    row = build_feature_row(events[1], window_features[1])
+    assert row["time_since_last_txn_s"] == 300.0
+
+
+def test_time_since_last_txn_s_is_capped_for_dormant_card() -> None:
+    events = [
+        _event(event_time="2019-01-01T00:00:00Z"),
+        _event(event_time="2019-06-01T00:00:00Z"),  # ~150 days later, way over the 30d cap
+    ]
+    window_features = compute_offline_card_features(events)
+    row = build_feature_row(events[1], window_features[1])
+    assert row["time_since_last_txn_s"] == float(CARD_WINDOWS["30d"])
+
+
+def test_is_new_city_30d_flags_first_visit_only() -> None:
+    events = [
+        _event(event_time="2019-06-01T00:00:00Z", merchant_city="Tucson"),
+        _event(event_time="2019-06-02T00:00:00Z", merchant_city="Phoenix"),  # new city
+        _event(event_time="2019-06-03T00:00:00Z", merchant_city="Tucson"),  # seen before (within 30d)
+    ]
+    window_features = compute_offline_card_features(events)
+    rows = [build_feature_row(e, wf) for e, wf in zip(events, window_features, strict=True)]
+    assert rows[0]["is_new_city_30d"] == 1  # no history at all
+    assert rows[1]["is_new_city_30d"] == 1  # Phoenix never seen before
+    assert rows[2]["is_new_city_30d"] == 0  # Tucson seen on day 1, within 30d
+
+
+def test_is_new_city_30d_true_again_outside_30d_window() -> None:
+    events = [
+        _event(event_time="2019-01-01T00:00:00Z", merchant_city="Tucson"),
+        _event(event_time="2019-03-01T00:00:00Z", merchant_city="Tucson"),  # ~59 days later
+    ]
+    window_features = compute_offline_card_features(events)
+    row = build_feature_row(events[1], window_features[1])
+    assert row["is_new_city_30d"] == 1
+
+
+def test_amount_over_mean_30d_uses_prior_history_only() -> None:
+    events = [
+        _event(event_time="2019-06-01T00:00:00Z", amount=10.0),
+        _event(event_time="2019-06-02T00:00:00Z", amount=20.0),
+        _event(event_time="2019-06-03T00:00:00Z", amount=100.0),
+    ]
+    window_features = compute_offline_card_features(events)
+    rows = [build_feature_row(e, wf) for e, wf in zip(events, window_features, strict=True)]
+    # First event: no history -> denominator falls back to 1.0.
+    assert rows[0]["amount_over_mean_30d"] == 10.0
+    # Third event: 30d mean of [10, 20] = 15 -> 100 / 15.
+    assert rows[2]["amount_over_mean_30d"] == pytest.approx(100.0 / 15.0)
 
 
 def test_offline_features_are_order_independent_on_input() -> None:
