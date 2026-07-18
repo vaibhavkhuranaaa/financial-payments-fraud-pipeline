@@ -152,7 +152,7 @@ services:
       BANK_DB_PORT: 1433
       BANK_DB_USER: sa
       BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
-      BANK_DB_NAME: ${BANK_DB_NAME:-master}
+      BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
       TOKENIZATION_SALT: ${TOKENIZATION_SALT:-change-me-local-only}
     depends_on:
       bank-db:
@@ -179,7 +179,7 @@ services:
       BANK_DB_PORT: 1433
       BANK_DB_USER: sa
       BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
-      BANK_DB_NAME: ${BANK_DB_NAME:-master}
+      BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
     depends_on:
       api:
         condition: service_started
@@ -205,12 +205,77 @@ services:
       BANK_DB_PORT: 1433
       BANK_DB_USER: sa
       BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
-      BANK_DB_NAME: ${BANK_DB_NAME:-master}
+      BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
       API_METRICS_URL: ${API_METRICS_URL:-http://api:8000/metrics}
       DASHBOARD_PORT: ${DASHBOARD_PORT:-8050}
     depends_on:
       bank-db:
         condition: service_healthy
+
+  # --- Ticket 11 (v1.2) CDC ingestion, profile "cdc" -----------------------
+  # Alternative to the "replay"-onto-Kafka path: transactions are INSERTed
+  # into bank.card_transactions (init-cdc + cdc-scan enable/pump CDC on it),
+  # and a later chunk of ticket 11 will add a `debezium/connect` service to
+  # this same profile to stream the resulting change table onto Kafka.
+
+  # One-shot: enable CDC on the bank DB + bank.card_transactions, then exit.
+  init-cdc:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pipeline
+    container_name: init-cdc
+    profiles: ["cdc"]
+    command: ["src.bank.cdc", "--enable"]
+    environment:
+      BANK_DB_HOST: bank-db
+      BANK_DB_PORT: 1433
+      BANK_DB_USER: sa
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
+    depends_on:
+      init-bank:
+        condition: service_completed_successfully
+
+  # Long-running: SQL Edge ships with SQL Server Agent stopped, so nothing
+  # calls sp_cdc_scan automatically. This pump replaces that Agent job.
+  cdc-scan:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pipeline
+    container_name: cdc-scan
+    profiles: ["cdc"]
+    command: ["src.bank.cdc", "--scan"]
+    environment:
+      BANK_DB_HOST: bank-db
+      BANK_DB_PORT: 1433
+      BANK_DB_USER: sa
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
+    depends_on:
+      init-cdc:
+        condition: service_completed_successfully
+
+  # Replays the TabFormer sample INTO bank.card_transactions (SQL becomes the
+  # true system of record; Debezium streams it out downstream).
+  txn-writer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pipeline
+    container_name: txn-writer
+    profiles: ["cdc"]
+    command: ["src.bank.txn_writer", "--input", "data/sample/transactions_sample.csv"]
+    environment:
+      <<: *pipeline-env
+      BANK_DB_HOST: bank-db
+      BANK_DB_PORT: 1433
+      BANK_DB_USER: sa
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
+    depends_on:
+      init-cdc:
+        condition: service_completed_successfully
+    volumes:
+      - ../data:/app/data
 
 volumes:
   bank-db-data:

@@ -14,6 +14,10 @@
 --                             the salted-SHA256 token produced by
 --                             src.pipeline.ingestion.to_event (imported, not
 --                             reimplemented, by src.bank.seed)
+--   bank.card_transactions    OLTP system-of-record: one row per authorization,
+--                             written by the ticket-11 src.bank.txn_writer replay
+--                             (contract-v1 shaped); CDC-enabled (src.bank.cdc) so
+--                             Debezium can capture inserts as the change feed
 --   bank.scored_transactions  insert-heavy audit log written by the ticket-07 scorer loop
 --   bank.fraud_alerts         analyst-facing alert queue written by the scorer,
 --                             updated (status) by the ticket-08 dashboard
@@ -72,6 +76,45 @@ BEGIN
         CONSTRAINT fk_cards_account FOREIGN KEY (account_id)
             REFERENCES bank.accounts (account_id)
     );
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.tables t
+    JOIN sys.schemas s ON s.schema_id = t.schema_id
+    WHERE s.name = 'bank' AND t.name = 'card_transactions'
+)
+BEGIN
+    CREATE TABLE bank.card_transactions (
+        event_id          NVARCHAR(64)   NOT NULL PRIMARY KEY,
+        schema_version    NVARCHAR(16)   NOT NULL,
+        card_token        CHAR(64)       NOT NULL,
+        user_id           NVARCHAR(64)   NOT NULL,
+        event_time        DATETIME2      NOT NULL,
+        amount            DECIMAL(12, 2) NOT NULL,
+        currency          CHAR(3)        NOT NULL,
+        channel           NVARCHAR(20)   NOT NULL,
+        merchant_name     NVARCHAR(200)  NULL,
+        merchant_city     NVARCHAR(100)  NULL,
+        merchant_state    NVARCHAR(100)  NULL,
+        merchant_country  CHAR(2)        NULL,
+        zip               NVARCHAR(10)   NULL,
+        mcc               INT            NULL,
+        errors            NVARCHAR(200)  NULL,
+        is_fraud          BIT            NULL,
+        inserted_at       DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
+    );
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'ix_card_transactions_inserted_at'
+      AND object_id = OBJECT_ID('bank.card_transactions')
+)
+BEGIN
+    CREATE INDEX ix_card_transactions_inserted_at
+        ON bank.card_transactions (inserted_at);
 END
 GO
 

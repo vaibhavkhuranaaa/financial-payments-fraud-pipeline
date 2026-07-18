@@ -43,7 +43,7 @@ from dotenv import load_dotenv
 from faker import Faker
 from sqlalchemy import Engine, text
 
-from src.bank.db import get_engine, run_script
+from src.bank.db import bootstrap_database, get_engine, run_script
 from src.pipeline.ingestion import TOKENIZATION_SALT, _card_token
 
 load_dotenv()
@@ -217,7 +217,9 @@ def write_dims(engine: Engine, data: SeedData) -> None:
 
 
 def seed(csv_path: str = SEED_INPUT_CSV, salt: str = TOKENIZATION_SALT) -> SeedData:
-    """Apply schema.sql, then derive + (re)write dimension rows. Idempotent."""
+    """Provision BANK_DB_NAME if needed, apply schema.sql, then derive +
+    (re)write dimension rows. Idempotent."""
+    bootstrap_database()
     engine = get_engine()
     apply_schema(engine)
     data = derive_seed_data(csv_path, salt)

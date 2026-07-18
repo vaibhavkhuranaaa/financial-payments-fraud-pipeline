@@ -9,12 +9,15 @@ via the `pymssql` DB-API driver (`mssql+pymssql://`), configured entirely
 from environment variables so the same code targets the local Docker
 container and a future managed SQL Server/Azure SQL instance unchanged.
 
-Connection target: by default this connects to the `master` database and
-all objects live under the `bank` schema (`bank.customers`, `bank.cards`,
-...) so no `CREATE DATABASE` step is required against the stock
-`azure-sql-edge` image. Set `BANK_DB_NAME` to point at a dedicated database
-instead (e.g. once one has been provisioned) — `get_engine()` honors
-whatever value is configured, defaulting to `master`.
+Connection target: this connects to a dedicated user database (`BANK_DB_NAME`,
+default `frauddemo`) with all objects living under the `bank` schema inside
+it (`bank.customers`, `bank.cards`, ...). A dedicated database — rather than
+the stock `master` — is required from ticket 11 onward because SQL Server/SQL
+Edge Change Data Capture (`sys.sp_cdc_enable_db`) can only be enabled on a
+user database, never on `master`. `bootstrap_database()` provisions
+`BANK_DB_NAME` if it doesn't exist yet; `get_engine()` then connects straight
+to it. Set `BANK_DB_NAME=master` to opt back into the pre-ticket-11 layout
+(bootstrap becomes a no-op in that case; CDC won't be available).
 """
 
 from __future__ import annotations
@@ -32,10 +35,9 @@ BANK_DB_HOST = os.environ.get("BANK_DB_HOST", "localhost")
 BANK_DB_PORT = int(os.environ.get("BANK_DB_PORT", "1433"))
 BANK_DB_USER = os.environ.get("BANK_DB_USER", "sa")
 BANK_DB_PASSWORD = os.environ.get("BANK_DB_PASSWORD", "LocalDev!Passw0rd")
-# Azure SQL Edge has no `CREATE DATABASE bank` step out of the box; objects
-# live under the `bank` SCHEMA inside the default `master` database unless a
-# dedicated database has been provisioned and BANK_DB_NAME overridden.
-BANK_DB_NAME = os.environ.get("BANK_DB_NAME", "master")
+# Dedicated user database (not `master`) so CDC (sp_cdc_enable_db) can be
+# enabled on it — see `bootstrap_database()`.
+BANK_DB_NAME = os.environ.get("BANK_DB_NAME", "frauddemo")
 
 def get_engine() -> Engine:
     """Build (but do not connect) a SQLAlchemy engine for the bank DB.
@@ -47,6 +49,31 @@ def get_engine() -> Engine:
         f"@{BANK_DB_HOST}:{BANK_DB_PORT}/{BANK_DB_NAME}"
     )
     return create_engine(url, pool_pre_ping=True, future=True)
+
+
+def bootstrap_database() -> None:
+    """Create BANK_DB_NAME if it doesn't exist yet. No-op when BANK_DB_NAME
+    is `master` (nothing to create).
+
+    Connects to `master` (the one database guaranteed to exist) with
+    `isolation_level="AUTOCOMMIT"` because `CREATE DATABASE` cannot run
+    inside a transaction. Must run before `get_engine()`/`apply_schema()`
+    target a not-yet-provisioned database.
+    """
+    if BANK_DB_NAME == "master":
+        return
+    url = (
+        f"mssql+pymssql://{BANK_DB_USER}:{BANK_DB_PASSWORD}"
+        f"@{BANK_DB_HOST}:{BANK_DB_PORT}/master"
+    )
+    engine = create_engine(url, pool_pre_ping=True, future=True, isolation_level="AUTOCOMMIT")
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text(f"IF DB_ID(N'{BANK_DB_NAME}') IS NULL CREATE DATABASE [{BANK_DB_NAME}]")
+            )
+    finally:
+        engine.dispose()
 
 
 def run_script(engine: Engine, sql_text: str) -> None:
