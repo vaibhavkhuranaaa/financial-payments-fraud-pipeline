@@ -20,7 +20,7 @@ Full plan: `~/.claude/plans/review-the-repository-plan-frolicking-gem.md` (local
 | 2 | `src/app.py`: /score, /healthz, /metrics + latency benchmark | **done** (commit c898f15; cold-path p99 9.9ms @ 1884 req/s; warm-Redis bench pending Phase 5) |
 | 3 | Docker compose, Terraform (Event Hubs/ACR/Container Apps), CI | **done** (commit 040253d; validated, NOT applied — images not yet built since src in flight) |
 | 4 | dbt marts, governance docs, README | **done** (README metrics filled from v2 full-data run; diagrams + governance docs updated to 1h/1d/7d/30d windows) |
-| 5 | E2E verify, Azure deploy + teardown test, tag v1.0 | pending |
+| 5 | E2E verify, Azure deploy + teardown test, tag v1.0 | **done** (2026-07-17: compose E2E verified — 114 Redis feature hashes, warm /score, quarantine; warm bench p99 10.8ms @ 1237 req/s; Azure deployed, live-verified, destroyed; tagged v1.0) |
 
 ## Done & verified
 - Repo scaffold (commit e0ccd29)
@@ -28,10 +28,11 @@ Full plan: `~/.claude/plans/review-the-repository-plan-frolicking-gem.md` (local
 - Phase 0 complete: Colima running (docker 29.5.2), `.venv` Python 3.11 with pinned deps, full TabFormer at `data/raw/card_transaction.v1.csv` (24M rows, 2.2GB, out of git), committed sample `data/sample/transactions_sample.csv` (76,989 rows / 7.1MB / 0.22% fraud; 100 users × most-recent ≤1000 txns each, per-card sequences intact, seed=42), contract v1, discipline scaffold
 
 ## In flight
+- **v1.0 COMPLETE (2026-07-17). Nothing in flight.** All Definition-of-Done boxes checked; local stack still runs via compose (see README). Streaming sink was rewritten during Phase 5 E2E (v2 windows broke the Spark sliding-window design — see commit "v2-compatible streaming sink" and features.py module docstring). Known accepted gaps are in README "What I'd Improve Next".
 - **v2 model iteration COMPLETE (2026-07-17):** `wip/model-iteration-v2` merged to main (merge commit 02f2fe4). API `/score` now builds its vector via the shared `build_feature_row` (skew rule); all 45 tests + `make check` green. README Key Results filled from the v2 full-data run (PR-AUC 0.0227, ROC-AUC 0.768, precision@top-0.1% 0.045); README/data-dictionary/tokenization-policy updated to 1h/1d/7d/30d windows. AI co-author trailers stripped from all local history (filter-branch + reflog expire + gc; verified zero). Retrain command if ever needed: `.venv/bin/python -m src.pipeline.train --input data/raw/card_transaction.v1.csv --since-year 2013 --until-year 2019` (~12 min).
 
 ## Next step (exact resume sequence)
-1. Phase 5 (task #6): `docker compose -f docker/docker-compose.yml up` E2E (producer profile `replay`; verify Redis `features:*` keys + `/score` warm path + DLQ), warm benchmark → README, `infra/terraform/deploy.sh` (prefix var, ~$40-50/mo), live latency, `destroy.sh` test, tag v1.0.
+None — v1.0 shipped. If resuming for v1.1+: candidates are in README "What I'd Improve Next" (feature-drift detection, idempotent foreachBatch Redis writes, dbt-on-Databricks staging). Redeploy any time with `infra/terraform/deploy.sh`; remember `destroy.sh` after demoing.
 
 ## Environment facts
 - macOS (darwin 25.5), system Python 3.14 (too new for PySpark → use uv-managed 3.11 venv at `.venv/`)
