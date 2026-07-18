@@ -113,11 +113,13 @@ def test_score_cold_card_when_hash_missing(tiny_booster: xgb.Booster) -> None:
 def test_score_warm_card_when_hash_present(tiny_booster: xgb.Booster) -> None:
     card_token = "b" * 64
     warm_hash = {
-        "txn_count_1m": "3",
-        "amount_sum_1m": "150.0",
-        "amount_mean_1m": "50.0",
-        "distinct_merchant_city_1m": "2",
-        "decline_rate_1m": "0.0",
+        "txn_count_1h": "3",
+        "amount_sum_1h": "150.0",
+        "amount_mean_1h": "50.0",
+        "distinct_merchant_city_1h": "2",
+        "decline_rate_1h": "0.0",
+        "amount_mean_30d": "48.5",
+        "last_event_ts": str(datetime.now(timezone.utc).timestamp() - 3600),
     }
     client = _make_client(tiny_booster, FakeRedis(hashes={f"features:{card_token}": warm_hash}))
     resp = client.post("/score", json=_sample_event(card_token=card_token))

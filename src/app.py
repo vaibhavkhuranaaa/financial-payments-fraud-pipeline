@@ -28,7 +28,7 @@ from flask import Flask, Response, current_app, jsonify, request
 from jsonschema import Draft202012Validator
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
-from src.pipeline.features import CARD_WINDOWS, enrich, window_feature_names
+from src.pipeline.features import CARD_WINDOWS, build_feature_row, window_feature_names
 
 load_dotenv()
 
@@ -141,24 +141,24 @@ def _build_feature_vector(
     redis_client: redis.Redis | None,
 ) -> tuple[list[float], bool]:
     """Enrich `event` + join Redis window features into a model-ready vector,
-    ordered exactly per `feature_columns`. Returns (vector, cold_card)."""
-    enriched = enrich(event)
+    ordered exactly per `feature_columns`. Returns (vector, cold_card).
+
+    All derivation lives in the shared ``build_feature_row`` (train/serve-skew
+    rule): this function only supplies zero-valued window defaults for keys the
+    Redis hash doesn't have (cold/partial cards) and flattens to the model's
+    column order. The hash's ``last_event_ts`` passes straight through —
+    ``build_feature_row`` is the one place that turns it into
+    ``time_since_last_txn_s``.
+    """
     window_hash, cold_card = _fetch_window_features(redis_client, event["card_token"])
 
-    row: dict[str, float] = {
-        "amount": float(event["amount"]),
-        "amount_log": float(enriched["amount_log"]),
-        "is_cnp": float(int(enriched["is_cnp"])),
-        "is_cross_border": float(int(enriched["is_cross_border"])),
-        "mcc_group_id": float(enriched["mcc_group_id"]),
-        "hour_of_day": float(enriched["hour_of_day"]),
-        "day_of_week": float(enriched["day_of_week"]),
+    window_features: dict[str, Any] = {
+        name: 0.0 for window_key in CARD_WINDOWS for name in window_feature_names(window_key)
     }
-    for window_key in CARD_WINDOWS:
-        for name in window_feature_names(window_key):
-            row[name] = float(window_hash.get(name, 0.0))
+    window_features.update(window_hash)
 
-    vector = [row[col] for col in feature_columns]
+    row = build_feature_row(event, window_features)
+    vector = [float(row[col]) for col in feature_columns]
     return vector, cold_card
 
 
