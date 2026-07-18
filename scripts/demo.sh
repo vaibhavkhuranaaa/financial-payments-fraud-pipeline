@@ -59,13 +59,14 @@ done
 echo "    topics ready: ${topics[*]}"
 
 if [[ "$CDC" == "1" ]]; then
-  echo "==> [3/4] seeding bank DB + starting CDC pipeline (Debezium) + scorer, dashboard"
-  # init-bank/init-cdc/connect-init are one-shot and sequenced by their own
-  # depends_on graph within this one `up`. No `producer` here — the CSV
-  # never touches Kafka directly in CDC mode, it's written into
-  # bank.card_transactions by txn-writer and captured by Debezium instead.
+  echo "==> [3/4] seeding bank DB + starting CDC pipeline + scorer, dashboard"
+  # init-bank/init-cdc are one-shot and sequenced by their own depends_on
+  # graph within this one `up`. No `producer` here — the CSV never touches
+  # Kafka directly in CDC mode: txn-writer INSERTs into
+  # bank.card_transactions and cdc-streamer emits the change feed
+  # (Debezium-shaped; see ADR 0003 for why not Debezium itself on SQL Edge).
   "${COMPOSE[@]}" up -d --build --wait --wait-timeout "$WAIT_TIMEOUT" \
-    init-bank init-cdc cdc-scan connect connect-init txn-writer cdc-transformer scorer dashboard
+    init-bank init-cdc cdc-scan cdc-streamer txn-writer cdc-transformer scorer dashboard
 else
   echo "==> [3/4] seeding bank DB + starting scorer, dashboard, replay producer"
   # init-bank is one-shot (depends_on bank-db healthy) and exits 0 once the
@@ -81,14 +82,14 @@ DASHBOARD_PORT="${DASHBOARD_PORT:-8050}"
 if [[ "$CDC" == "1" ]]; then
   cat <<EOF
 
-  Mode      : CDC (Debezium: bank.card_transactions -> Kafka -> scorer)
+  Mode      : CDC (bank.card_transactions change feed -> Kafka -> scorer)
   Dashboard : http://localhost:${DASHBOARD_PORT}
   API       : http://localhost:8000/healthz
   Metrics   : http://localhost:8000/metrics
 
-Transactions are being written into bank.card_transactions, captured by
-Debezium, and scored continuously; give the dashboard ~10-20s to show its
-first live data.
+Transactions are being written into bank.card_transactions, streamed off
+its CDC change table, and scored continuously; give the dashboard ~10-20s
+to show its first live data.
 
 Stop everything with:  make demo-down
 EOF

@@ -121,6 +121,23 @@ GO
 IF NOT EXISTS (
     SELECT 1 FROM sys.tables t
     JOIN sys.schemas s ON s.schema_id = t.schema_id
+    WHERE s.name = 'bank' AND t.name = 'cdc_offsets'
+)
+BEGIN
+    -- Durable LSN offsets for src.pipeline.cdc_streamer: one row per consumer,
+    -- written strictly AFTER the producer flush for the corresponding LSN
+    -- window (commit-after-flush; see ADR 0003).
+    CREATE TABLE bank.cdc_offsets (
+        consumer_name  NVARCHAR(64)  NOT NULL PRIMARY KEY,
+        last_lsn       BINARY(10)    NOT NULL,
+        updated_at     DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
+    );
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.tables t
+    JOIN sys.schemas s ON s.schema_id = t.schema_id
     WHERE s.name = 'bank' AND t.name = 'scored_transactions'
 )
 BEGIN

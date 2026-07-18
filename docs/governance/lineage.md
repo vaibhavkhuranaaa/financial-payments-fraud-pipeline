@@ -8,8 +8,18 @@ flowchart LR
         A[TabFormer CSV\ndata/sample or data/raw]
     end
 
-    subgraph Ingestion
+    subgraph Ingestion["Ingestion — replay mode (make demo)"]
         B["ingestion.py::to_event()\ncontract validation + PAN tokenization"]
+    end
+
+    subgraph CDC["Ingestion — CDC mode (make demo-cdc, ticket 11)"]
+        TW["bank.txn_writer\nsame to_event() mapping,\nwrites INTO SQL"]
+        CT[(bank.card_transactions\nOLTP system of record)]
+        CDCT[(cdc.bank_card_transactions_CT\nchange table)]
+        PUMP["bank.cdc --scan\nsp_cdc_scan pump\n(replaces SQL Agent)"]
+        DBZ["cdc_streamer.py\nLSN-windowed reads,\nDebezium-shaped envelopes\n(real Debezium: profile 'debezium',\nfull SQL Server only — ADR 0003)"]
+        CDCTOPIC[["bankdb.frauddemo.\nbank.card_transactions"]]
+        XF["cdc_transformer.py\nenvelope -> contract-v1\n+ re-validate"]
     end
 
     subgraph Broker
@@ -66,6 +76,15 @@ flowchart LR
 
     A --> B --> C
     B -. invalid rows .-> C_DLQ
+
+    A -->|CDC mode| TW
+    TW -->|"batch INSERT\n(validated first;\ninvalid logged, no insert)"| CT
+    CT -->|log capture\nvia PUMP| CDCT
+    CDCT --> DBZ
+    DBZ --> CDCTOPIC
+    CDCTOPIC --> XF
+    XF -->|"op c/r -> event\nkeyed by card_token"| C
+    XF -. invalid / unknown op .-> C_DLQ
     C --> D
     D -. invalid .-> D_Q
     D --> E
@@ -106,6 +125,8 @@ flowchart LR
 
 - **Single source of truth for feature *definitions*:** `src/pipeline/features.py` (`enrich()`, `CARD_WINDOWS`, `FEATURE_COLUMNS`) is imported by both the streaming job and the offline training builder — this is the train/serve-skew prevention mechanism (ADR 0001, decision 4).
 - **Single source of truth for event *mapping*:** `src/pipeline/ingestion.py::to_event()` is the only place raw TabFormer rows become contract-v1 events for the live streaming path. The dbt staging model (`stg_transactions.sql`) re-implements the same rules in SQL so `dbt build` can run standalone in CI against the committed sample CSV, without a live Kafka/Spark/Delta stack. **This is a hand-maintained duplication, not a shared library** — SQL can't import the Python module. If `to_event()`'s mapping rules change, `stg_transactions.sql` (and the `country_name_to_iso2`/`mcc_group` dbt macros) must be updated to match. See "What I'd Improve Next" in the README.
+- **CDC mode (v1.2) keeps one mapping and one contract:** `bank.txn_writer` reuses `to_event()` (imported, never reimplemented) to validate/tokenize *before* the INSERT into `bank.card_transactions`, and `cdc_transformer.py` re-validates the reconstructed event against the same JSON-Schema contract before producing to `transactions`. Downstream (Spark/scorer/API) is byte-identical between replay and CDC modes. Update/delete change events are skipped by design (authorizations are immutable); unknown ops and mapping failures go to the Kafka DLQ.
+- **Delivery semantics (v1.2):** at-least-once end to end with explicit commit-after-flush boundaries — the CDC transformer commits consumer offsets only after its producer flush; the scorer commits only after its bank-DB flush; duplicates from redelivery are absorbed by the `event_id` PK on insert (effectively-once in SQL). See ADR 0003.
 - **Two independent validation points:** the producer validates against the JSON-Schema contract before publish; the stream job re-validates on read (defense in depth — it must not trust the wire). Both route invalid records to a dead-letter path (Kafka DLQ topic for the producer, a Delta `_quarantine` table for the stream — see the module docstring in `features.py` for why the stream uses Delta instead of a second Kafka producer).
 - **Two consumers of the online/offline feature split:** Redis (`features:{card_token}`) serves the live `/score` path with a hard latency budget; Delta (`{DELTA_ROOT}/events`, `{DELTA_ROOT}/card_features`) is the offline/replayable copy used by training and (if pointed at Delta parquet exports instead of the sample CSV) could back the dbt marts too.
 - **dbt is a downstream, parallel consumer of the same contract**, not a step in the online path — it never touches Redis, the model, or the API. It exists purely for fraud-ops analytics (daily fraud-rate trend, merchant/mcc risk, channel mix) over data governed by the same contract as the live pipeline.

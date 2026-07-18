@@ -14,9 +14,15 @@ Card-issuer fraud teams need a decision — approve or hold for review — in mi
 
 ```mermaid
 flowchart LR
-    A[TabFormer CSV] --> B["ingestion.py\nvalidate + tokenize"]
+    A[TabFormer CSV] -->|replay mode| B["ingestion.py\nvalidate + tokenize"]
     B --> C[["transactions"\nRedpanda / Event Hubs]]
     B -. invalid .-> C_DLQ[["transactions.dlq"]]
+    A -->|CDC mode| TW["txn_writer.py\nsame mapping, INSERT into SQL"]
+    TW --> CT[("bank.card_transactions\nsystem of record")]
+    CT -->|"CDC change tables\n+ cdc_streamer.py"| CDCT[["bankdb.frauddemo.\nbank.card_transactions"]]
+    CDCT --> XF["cdc_transformer.py\nenvelope → contract-v1"]
+    XF --> C
+    XF -. invalid .-> C_DLQ
     C --> D["features.py\nSpark Structured Streaming\nre-validate + enrich"]
     D -. invalid .-> DQ[(Delta _quarantine)]
     D --> E[Windowed aggregates\n1h / 1d / 7d / 30d per card]
@@ -43,7 +49,7 @@ flowchart LR
     J -.->|"/metrics"| DASH
 ```
 
-Full lineage detail (including the DLQ/quarantine dead-letter paths, the bank-DB read/write paths, and exactly which module owns which mapping) is in [`docs/governance/lineage.md`](docs/governance/lineage.md). Field-level definitions — including the `bank.*` tables — are in [`docs/governance/data-dictionary.md`](docs/governance/data-dictionary.md). The data contract itself is [`contracts/transaction.schema.json`](contracts/transaction.schema.json). Key architecture decisions and their rationale are in [`docs/adr/0001-stack-and-architecture.md`](docs/adr/0001-stack-and-architecture.md) (core stack) and [`docs/adr/0002-bank-scorer-dashboard.md`](docs/adr/0002-bank-scorer-dashboard.md) (bank DB / scorer loop / dashboard).
+Full lineage detail (including the DLQ/quarantine dead-letter paths, the bank-DB read/write paths, and exactly which module owns which mapping) is in [`docs/governance/lineage.md`](docs/governance/lineage.md). Field-level definitions — including the `bank.*` tables — are in [`docs/governance/data-dictionary.md`](docs/governance/data-dictionary.md). The data contract itself is [`contracts/transaction.schema.json`](contracts/transaction.schema.json). Key architecture decisions and their rationale are in [`docs/adr/0001-stack-and-architecture.md`](docs/adr/0001-stack-and-architecture.md) (core stack) and [`docs/adr/0002-bank-scorer-dashboard.md`](docs/adr/0002-bank-scorer-dashboard.md) (bank DB / scorer loop / dashboard), and [`docs/adr/0003-cdc-ingestion.md`](docs/adr/0003-cdc-ingestion.md) (CDC ingestion and delivery semantics).
 
 ## Key Results
 
@@ -122,6 +128,16 @@ make demo
 
 Give the dashboard ~10–20s after that to show its first live data. Tear everything down with `make demo-down` (or `make demo-down-volumes` to also drop the bank DB's persisted data for a fully clean-state re-test).
 
+### CDC mode — the production-real ingest (v1.2)
+
+```bash
+make demo-cdc
+```
+
+Same dashboard, same scorer, same API — but the ingest is how a real bank does it: transactions are INSERTed into `bank.card_transactions` (the OLTP system of record), SQL Server **Change Data Capture** picks them off the transaction log into change tables, a streamer emits the change feed onto Kafka in **Debezium's envelope format**, and a thin transformer (`src/pipeline/cdc_transformer.py`) maps it back onto the same contract-v1 `transactions` topic — so everything downstream is byte-identical between modes. The CSV never touches Kafka directly in this mode; measured insert→scored end-to-end latency is ~1.2s. Delivery is explicitly at-least-once with commit-after-flush offset boundaries at every consumer (the streamer's LSN offset lives in SQL, written only after the producer flush), deduped to effectively-once in SQL by the `event_id` primary key — kill the streamer mid-run and it resumes from its LSN without losing rows or duplicating any.
+
+One honest caveat, documented in [`docs/adr/0003-cdc-ingestion.md`](docs/adr/0003-cdc-ingestion.md): the change feed is emitted by `src/pipeline/cdc_streamer.py`, not by Debezium itself — Azure SQL Edge (the only ARM-native SQL Server image) has CLR permanently disabled, and Debezium's streaming loop needs the CLR-backed `sys.fn_cdc_increment_lsn` on every iteration (its snapshot works; streaming then fails forever — found live). The streamer reads the same log-derived change tables, re-implements that one function (10 bytes of big-endian arithmetic), and emits byte-compatible envelopes — a round-trip unit test pins that the transformer can't tell the difference. The real Debezium Connect service + connector config ship in the repo under the opt-in `debezium` compose profile as the drop-in for full SQL Server / Azure SQL, where the Agent and CLR exist. The same ADR covers the other Edge caveat: no SQL Server Agent, so a `sp_cdc_scan` pump service replaces the capture job.
+
 *(Screenshot placeholder — drop a dashboard screen-share capture at `docs/img/dashboard.png` and reference it here: `![Fraud-ops dashboard](docs/img/dashboard.png)`)*
 
 ### The 3-minute recruiter demo script
@@ -175,7 +191,7 @@ Event Hubs **Standard** tier (required for the Kafka-compatible endpoint) is the
 - **Dashboard:** Plotly Dash (pure Python, no CDN) fraud-ops console — live feed, alert queue with Confirm/Dismiss actions, latency/throughput/cold-card charts, `docker/Dockerfile.dashboard`
 
 ## What I'd Improve Next
-- **CDC from the bank DB instead of CSV replay.** The current ingestion path replays a static CSV onto Kafka; the production-real version of this pipeline would run Debezium CDC against `bank.*` (or an equivalent OLTP core-banking store) so `transactions` is a live change stream off the actual system of record, not a simulated replay. Scoped as v1.2 in `docs/tickets/11-cdc-ingestion.md`.
+- **Schema registry + typed events.** Events are loose JSON validated against a JSON-Schema contract at each boundary; the next step is Avro/Protobuf with a schema registry (Redpanda ships one) so contract evolution is enforced by the broker path itself rather than by convention. (CDC ingestion — the previous top item here — shipped in v1.2: `make demo-cdc`, ADR 0003.)
 - **Warm-Redis latency benchmark.** The only latency number in this README today is the cold-path (every card missing from Redis) baseline — the number that actually matters for production capacity planning is steady-state, with realistic Redis hit rates.
 - **dbt-over-DuckDB vs. a real warehouse.** The dbt project reads the sample CSV directly (via DuckDB's `read_csv_auto`), and `stg_transactions.sql` hand-mirrors `ingestion.py::to_event()`'s mapping logic in SQL rather than sharing one implementation — SQL can't import the Python module, so the two can drift if one changes without the other. On Databricks SQL, this staging model would instead read the same Delta tables the streaming job already writes, eliminating the duplication entirely.
 - **Single-node streaming.** Redpanda and the Spark job both run as single instances locally; there's no tested failover/rebalance story, and Spark's `foreachBatch` Redis writes are not currently idempotent under retry (a replayed microbatch after a crash could double-count a window's contribution if the same batch is retried non-atomically).

@@ -101,6 +101,10 @@ The system-of-record the pipeline hangs off (ADR 0002). Dimensional tables (`cus
 | `card_type` | `NVARCHAR(20)` | `["visa", "mastercard", "amex"][card_index % 3]` | Deterministic pseudo-network assignment; not sourced from TabFormer (which has no network field). |
 | `issued_at` | `DATETIME2` | fixed epoch `+ card_index` days | Deterministic placeholder issue date, staggered per card index so multiple cards on one user don't collide. |
 
+### `bank.card_transactions` — OLTP authorization log, one row per transaction (ticket 11, CDC mode)
+
+The system-of-record for the v1.2 CDC ingest path (`make demo-cdc`). Written by `src/bank/txn_writer.py`, which reuses `ingestion.py::to_event()` — so every column is exactly a contract-v1 field persisted to SQL (`event_id` PK, `schema_version`, `card_token`, `user_id`, `event_time DATETIME2`, `amount DECIMAL(12,2)`, `currency CHAR(3)`, `channel`, `merchant_*`, `zip`, `mcc`, `errors`, `is_fraud BIT NULL`) plus a DB-assigned `inserted_at` (indexed). CDC is enabled on this table (`src/bank/cdc.py --enable`); Debezium streams its change feed to `bankdb.frauddemo.bank.card_transactions`, and `src/pipeline/cdc_transformer.py` maps change events back onto contract-v1 (dropping `inserted_at`). Field semantics are identical to §1 — see the contract table above; `is_fraud` is retained for the same demo-labeling reason it exists on the topic.
+
 ### `bank.scored_transactions` — insert-heavy audit log, one row per scored event
 
 Written by `src/pipeline/scorer.py` for every event it consumes off the `transactions` topic and successfully scores; idempotent on `event_id` (duplicate inserts from replays/consumer-group rebalances are swallowed, not fatal). Indexed on `(scored_at)` and `(card_token)`.

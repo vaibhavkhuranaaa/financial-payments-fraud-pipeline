@@ -38,9 +38,9 @@ demo-cdc:
 # Tear down the demo stack (containers only — named volumes, e.g. the bank
 # DB's data, persist so re-running `make demo` is fast on a warm cache).
 demo-down:
-	docker compose -f $(COMPOSE_FILE) --profile demo --profile replay --profile cdc down
+	docker compose -f $(COMPOSE_FILE) --profile demo --profile replay --profile cdc --profile debezium down
 
 # Same as demo-down but also drops named volumes (bank-db-data) for a fully
 # clean-state re-test.
 demo-down-volumes:
-	docker compose -f $(COMPOSE_FILE) --profile demo --profile replay --profile cdc down -v
+	docker compose -f $(COMPOSE_FILE) --profile demo --profile replay --profile cdc --profile debezium down -v

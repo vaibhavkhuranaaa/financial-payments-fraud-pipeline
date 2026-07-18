@@ -278,15 +278,52 @@ services:
     volumes:
       - ../data:/app/data
 
+  # Streams bank.card_transactions' CDC change table onto Kafka as
+  # Debezium-shaped envelopes. This — not Debezium Connect — is what
+  # `make demo-cdc` runs, because Azure SQL Edge has CLR permanently disabled
+  # and Debezium's streaming loop needs the CLR-backed
+  # sys.fn_cdc_increment_lsn on every iteration (verified live: connector
+  # snapshots fine, then errors forever). The streamer reads the same change
+  # tables and emits the same topic contract, so swapping in real Debezium
+  # against full SQL Server (profile "debezium" below) changes nothing
+  # downstream. See ADR 0003.
+  cdc-streamer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pipeline
+    container_name: cdc-streamer
+    profiles: ["cdc"]
+    command: ["src.pipeline.cdc_streamer"]
+    environment:
+      <<: *pipeline-env
+      KAFKA_TOPIC_CDC: ${KAFKA_TOPIC_CDC:-bankdb.frauddemo.bank.card_transactions}
+      BANK_DB_HOST: bank-db
+      BANK_DB_PORT: 1433
+      BANK_DB_USER: sa
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
+    depends_on:
+      init-cdc:
+        condition: service_completed_successfully
+      redpanda:
+        condition: service_healthy
+
   # Kafka Connect running the Debezium SQL Server source connector. Quay's
   # image is used (not Docker Hub's `debezium/connect`, whose tags are dead)
   # — verified to start on ARM against this compose's `redpanda` broker and
   # ship io.debezium.connector.sqlserver.SqlServerConnector. JVM start is
   # slow, hence the generous start_period.
+  #
+  # Profile "debezium" (NOT part of `make demo-cdc`): against Azure SQL Edge
+  # the connector's snapshot works but streaming fails every iteration on the
+  # CLR-backed sys.fn_cdc_increment_lsn (CLR cannot be enabled on Edge —
+  # sp_configure rejects it as unsupported). Keep this service for running
+  # the identical config against full SQL Server / Azure SQL, where it is a
+  # drop-in replacement for cdc-streamer. See ADR 0003.
   connect:
     image: quay.io/debezium/connect:2.7
     container_name: connect
-    profiles: ["cdc"]
+    profiles: ["debezium"]
     environment:
       BOOTSTRAP_SERVERS: redpanda:9092
       GROUP_ID: fraud-connect
@@ -314,7 +351,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.pipeline
     container_name: connect-init
-    profiles: ["cdc"]
+    profiles: ["debezium"]
     command: ["src.pipeline.connect_register"]
     environment:
       CONNECT_URL: http://connect:8083
@@ -322,14 +359,14 @@ services:
     depends_on:
       connect:
         condition: service_healthy
-      init-cdc:
-        condition: service_completed_successfully
     volumes:
       - ../docker/connect:/app/docker/connect
 
-  # Transforms the Debezium change topic (bankdb.frauddemo.bank.card_transactions)
-  # back onto contract-v1 `transactions`, so the Spark features job / scorer
-  # / API downstream need zero changes between "replay" and "cdc" modes.
+  # Transforms the Debezium-shaped change topic
+  # (bankdb.frauddemo.bank.card_transactions, produced by cdc-streamer — or
+  # by real Debezium under the "debezium" profile) back onto contract-v1
+  # `transactions`, so the Spark features job / scorer / API downstream need
+  # zero changes between "replay" and "cdc" modes.
   cdc-transformer:
     build:
       context: ..
@@ -341,7 +378,7 @@ services:
       <<: *pipeline-env
       KAFKA_TOPIC_CDC: ${KAFKA_TOPIC_CDC:-bankdb.frauddemo.bank.card_transactions}
     depends_on:
-      connect-init:
+      init-cdc:
         condition: service_completed_successfully
       redpanda:
         condition: service_healthy
