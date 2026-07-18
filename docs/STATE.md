@@ -21,6 +21,10 @@ Full plan: `~/.claude/plans/review-the-repository-plan-frolicking-gem.md` (local
 | 3 | Docker compose, Terraform (Event Hubs/ACR/Container Apps), CI | **done** (commit 040253d; validated, NOT applied — images not yet built since src in flight) |
 | 4 | dbt marts, governance docs, README | **done** (README metrics filled from v2 full-data run; diagrams + governance docs updated to 1h/1d/7d/30d windows) |
 | 5 | E2E verify, Azure deploy + teardown test, tag v1.0 | **done** (2026-07-17: compose E2E verified — 114 Redis feature hashes, warm /score, quarantine; warm bench p99 10.8ms @ 1237 req/s; Azure deployed, live-verified, destroyed; tagged v1.0) |
+| 6 | Bank system-of-record: `bank-db` (Azure SQL Edge), `src/bank/schema.sql`+`seed.py`+`db.py`, `init-bank` compose service (ticket 06) | **done** (commit addf3f2; seed fingerprint `ff724846752b` — 100 customers / 100 accounts / 130 cards, deterministic Faker seed=42; bank-db healthcheck is a TCP-only `/dev/tcp` probe, no `sqlcmd` in the azure-sql-edge image) |
+| 7 | Live scorer loop: `src/pipeline/scorer.py`, `scorer` compose service (ticket 07) | **done** (commit 9256e02; Kafka `transactions` consumer → same `/score` endpoint the API benchmark measures → `bank.scored_transactions`/`bank.fraud_alerts`, idempotent on `event_id`) |
+| 7 | Fraud-ops dashboard: `src/dashboard/`, `docker/Dockerfile.dashboard`, `dashboard` compose service (ticket 08) | **done** (commit b985836; Plotly Dash on :8050 — stat tiles, live feed, alerts queue with Confirm/Dismiss write-back, score/throughput/alert-mix/cold-card charts) |
+| 8 | One-command demo (`make demo`/`scripts/demo.sh`), optional Azure demo Terraform module (`infra/terraform/demo.tf`), CI gate; ADR 0002 + README + governance docs; tag v1.1 | **done** (commit ff914c6 for demo/infra/CI; docs finished this ticket — 2026-07-18: `make demo` clean-state verified ~4:38 on a warm image cache, alerts flowing (`fraud_alerts` 1,147→1,582 over 10s); terraform demo module validate/plan-only, never applied, ~$1.50–2.50/day estimate if run) |
 
 ## Done & verified
 - Repo scaffold (commit e0ccd29)
@@ -28,22 +32,25 @@ Full plan: `~/.claude/plans/review-the-repository-plan-frolicking-gem.md` (local
 - Phase 0 complete: Colima running (docker 29.5.2), `.venv` Python 3.11 with pinned deps, full TabFormer at `data/raw/card_transaction.v1.csv` (24M rows, 2.2GB, out of git), committed sample `data/sample/transactions_sample.csv` (76,989 rows / 7.1MB / 0.22% fraud; 100 users × most-recent ≤1000 txns each, per-card sequences intact, seed=42), contract v1, discipline scaffold
 
 ## In flight
-- **v1.0 COMPLETE (2026-07-17). Nothing in flight.** All Definition-of-Done boxes checked; local stack still runs via compose (see README). Streaming sink was rewritten during Phase 5 E2E (v2 windows broke the Spark sliding-window design — see commit "v2-compatible streaming sink" and features.py module docstring). Known accepted gaps are in README "What I'd Improve Next".
+- **v1.1 COMPLETE (2026-07-18). Nothing in flight.** Tickets 06–10 all done (commits addf3f2, 9256e02, b985836, ff914c6 + docs commit). Final orchestrator E2E verify 2026-07-18: `make demo` up, dashboard :8050 200, scoring ~200 events/s (`scored_transactions` +1600/8s, 14.7k alerts); kill-redis → dashboard stayed 200, cold-card share hit 100%; teardown clean (`docker ps` empty). Nuance: after restarting Redis, cold-card share does NOT recover in seconds — Redis is in-memory, features repopulate only as cards recur (~1 min+); demo talk track's "recover" beat needs that pause. Tagged `v1.1`.
+- **v1.0 COMPLETE (2026-07-17).** All Definition-of-Done boxes checked; local stack still runs via compose (see README). Streaming sink was rewritten during Phase 5 E2E (v2 windows broke the Spark sliding-window design — see commit "v2-compatible streaming sink" and features.py module docstring). Known accepted gaps are in README "What I'd Improve Next".
 - **v2 model iteration COMPLETE (2026-07-17):** `wip/model-iteration-v2` merged to main (merge commit 02f2fe4). API `/score` now builds its vector via the shared `build_feature_row` (skew rule); all 45 tests + `make check` green. README Key Results filled from the v2 full-data run (PR-AUC 0.0227, ROC-AUC 0.768, precision@top-0.1% 0.045); README/data-dictionary/tokenization-policy updated to 1h/1d/7d/30d windows. AI co-author trailers stripped from all local history (filter-branch + reflog expire + gc; verified zero). Retrain command if ever needed: `.venv/bin/python -m src.pipeline.train --input data/raw/card_transaction.v1.csv --since-year 2013 --until-year 2019` (~12 min).
 
-## Next step (exact resume sequence) — v1.1 build approved 2026-07-17
-Approved plan: recruiter-ready demo — Azure SQL Edge system-of-record + live scorer loop + Plotly Dash fraud-ops dashboard + `make demo`. Full plan mirrored in tickets; costs: local $0, optional Azure demo-day ~$1.50–2.50/day (ask user before any `terraform apply`, ~$2–3 one-off).
+## Next step (exact resume sequence) — v1.2 CDC ingestion (user approved 2026-07-18: v1.1 first, v1.2 next session)
+v1.1 is tagged; v1.2 = Debezium CDC bank-DB→Kafka replacing CSV replay as the headline ingest (`docs/tickets/11-cdc-ingestion.md`).
 
-1. Execute `docs/tickets/06-bank-db.md` → `07-scorer-loop.md` + `08-dashboard.md` (parallelizable after 06) → `09-demo-infra-ci.md` → `10-docs-tests.md`, each via a **Sonnet subagent** (self-contained specs; orchestrator reviews diffs + runs gates, fixes seams inline).
-2. Verify per plan: `make demo` from clean state (dashboard :8050, alerts flowing, zero manual steps), kill-redis degradation visible, `make check` green.
-3. Tag `v1.1`, push (history is clean — no AI trailers, keep it that way).
-4. Orchestration rules: auto-edit /goal mode, don't stop until done; at 95% session usage write `docs/HANDOFF.md` + update this file + exact follow-up prompt, commit green first.
+1. Read `docs/tickets/11-cdc-ingestion.md`; if it needs a design pass, do it before code.
+2. Execute via ONE Sonnet subagent per self-contained chunk (point at ticket file, don't paste content); orchestrator (strongest model) reviews diffs, runs gates (`make check` + ticket acceptance), fixes seams inline — never respawn for small fixes.
+3. Token rules: no exploratory subagents; read only what a decision needs; batch independent tool calls.
+4. Cost rule: terraform validate/plan only — ask the user before any `apply`.
+5. Verify E2E, update this file, tag `v1.2`, push (history stays free of AI co-author trailers).
+6. At 95% session usage: STOP feature work, commit green work only, write `docs/HANDOFF.md` (done / in-flight / exact next step / gotchas / container state), update this file, print the fresh-session follow-up prompt.
 
 Fresh-session follow prompt:
-> Continue the fraud pipeline v1.1 build. Read docs/STATE.md and docs/tickets/06–10, execute in order with Sonnet subagents per the orchestration notes, /goal mode, auto-edit, handoff at 95%.
+> /goal Continue fraud-pipeline v1.2 (CDC ingestion). Read docs/STATE.md first — source of truth — then docs/tickets/11-cdc-ingestion.md. Sonnet subagents per the orchestration notes in STATE.md Next step, auto-edit, handoff at 95%.
 
 ## Backlog (approved direction, post-v1.1)
-- **v1.2 = CDC ingestion** (`docs/tickets/11-cdc-ingestion.md`): Debezium bank-DB→Kafka replaces CSV replay as the headline; do not start before v1.1 tags.
+- **v1.2 = CDC ingestion** (`docs/tickets/11-cdc-ingestion.md`): now unblocked (v1.1 tagged) — see Next step above.
 - **v1.3 candidate = dual auth/settlement streams** (`docs/tickets/12-dual-stream.md`): stub only, needs design pass + user approval. Graph/ring features explicitly rejected.
 
 ## Environment facts

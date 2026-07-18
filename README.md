@@ -32,9 +32,18 @@ flowchart LR
     K --> L[fct_daily_fraud_rate]
     K --> N[fct_merchant_risk]
     K --> O[fct_channel_mix]
+    C --> S["scorer.py\nKafka consumer"]
+    S -->|"POST /score"| J
+    J --> S
+    S --> BDB[("bank-db\nAzure SQL Edge")]
+    N1["bank.seed\n(Faker, seed=42)"] -.derives dims from.-> A
+    N1 --> BDB
+    BDB --> DASH["dashboard\nPlotly Dash :8050"]
+    DASH -->|"Confirm / Dismiss"| BDB
+    J -.->|"/metrics"| DASH
 ```
 
-Full lineage detail (including the DLQ/quarantine dead-letter paths and exactly which module owns which mapping) is in [`docs/governance/lineage.md`](docs/governance/lineage.md). Field-level definitions are in [`docs/governance/data-dictionary.md`](docs/governance/data-dictionary.md). The data contract itself is [`contracts/transaction.schema.json`](contracts/transaction.schema.json). Key architecture decisions and their rationale are in [`docs/adr/0001-stack-and-architecture.md`](docs/adr/0001-stack-and-architecture.md).
+Full lineage detail (including the DLQ/quarantine dead-letter paths, the bank-DB read/write paths, and exactly which module owns which mapping) is in [`docs/governance/lineage.md`](docs/governance/lineage.md). Field-level definitions — including the `bank.*` tables — are in [`docs/governance/data-dictionary.md`](docs/governance/data-dictionary.md). The data contract itself is [`contracts/transaction.schema.json`](contracts/transaction.schema.json). Key architecture decisions and their rationale are in [`docs/adr/0001-stack-and-architecture.md`](docs/adr/0001-stack-and-architecture.md) (core stack) and [`docs/adr/0002-bank-scorer-dashboard.md`](docs/adr/0002-bank-scorer-dashboard.md) (bank DB / scorer loop / dashboard).
 
 ## Key Results
 
@@ -93,6 +102,46 @@ curl -X POST http://localhost:8000/score -H 'Content-Type: application/json' -d 
 - `make check` (lint + tests + dbt build + terraform validate + compose config validate) is the pre-push gate; see `Makefile`/`scripts/check.sh`.
 - To run the analytics layer standalone: `cd dbt && ../.venv/bin/dbt build --profiles-dir .` (builds against the committed sample CSV, no live services required).
 
+## Run the Demo
+
+The steps above bring up the core streaming path only. `make demo` additionally brings up the v1.1 pieces — a core-banking system-of-record (Azure SQL Edge), a live scorer loop, and a fraud-ops dashboard — so a fresh clone goes from `git clone` to a live, alert-generating dashboard with **one command and zero manual steps**:
+
+```bash
+git clone https://github.com/<your-username>/financial-payments-fraud-pipeline.git
+cd financial-payments-fraud-pipeline
+make demo
+```
+
+`scripts/demo.sh` (idempotent — safe to re-run while already up) does everything: builds/starts the core stack + `bank-db`, creates the Kafka topics, seeds the bank DB (`src/bank/seed.py`, deterministic Faker-synthetic customers/accounts/cards derived from `data/sample/transactions_sample.csv`), and starts the scorer loop, dashboard, and replay producer. On a warm image cache this completes in well under 5 minutes end to end, with alerts already flowing by the time it prints:
+
+```
+  Dashboard : http://localhost:8050
+  API       : http://localhost:8000/healthz
+  Metrics   : http://localhost:8000/metrics
+```
+
+Give the dashboard ~10–20s after that to show its first live data. Tear everything down with `make demo-down` (or `make demo-down-volumes` to also drop the bank DB's persisted data for a fully clean-state re-test).
+
+*(Screenshot placeholder — drop a dashboard screen-share capture at `docs/img/dashboard.png` and reference it here: `![Fraud-ops dashboard](docs/img/dashboard.png)`)*
+
+### The 3-minute recruiter demo script
+
+A talk track for walking someone through `make demo` live, panel by panel.
+
+**0:00 — Open with the shape of the problem (10s).** *"This is a fraud-ops console sitting on top of a streaming pipeline — TabFormer credit-card transactions are being replayed onto Kafka right now, scored in real time by a Flask API, and everything you're about to see updates every two seconds with zero manual refresh."*
+
+**0:10 — Header stat tiles (20s).** *"Top row: transactions scored — the total and the last-60-second rate, so you can see it's live, not a static snapshot. Open alerts — the analyst's queue. Scoring latency — p50/p95/p99, parsed straight off the API's Prometheus `/metrics`, because a fraud score that arrives after the authorization decision is worthless. And the model card — PR-AUC and ROC-AUC from the actual training run, not a claimed number."*
+
+**0:30 — Live feed + score distribution (30s).** *"Live scored transactions on the left is the last ~20 events landing in `bank.scored_transactions` — masked card token, merchant, amount, score, decision. Score distribution is log-scale on purpose: fraud is rare, so almost everything piles up near zero and you'd never see the tail on a linear axis."*
+
+**1:00 — The suspicious-transaction moment (30s).** *"Watch the Open fraud alerts panel — when a replayed transaction crosses the model's threshold, it shows up here within a couple seconds, joined all the way back to the customer: name, risk tier, credit limit, the actual merchant and amount. This is `bank.fraud_alerts` joined to `bank.cards → accounts → customers` live. As an analyst I can click **Confirm fraud** or **Dismiss** right here — that's a real SQL `UPDATE` on `status`/`reviewed_at`, not a mock button; refresh and the state's still there."*
+
+**1:30 — Kill-redis resilience beat (45s).** *"Now watch the Cold-card share chart while I do this: `docker kill redis`."* (run it) *"Redis is the online feature store — when it's unreachable, the scoring API doesn't fall over, it falls back to zero-history features and marks the response `cold_card: true`. Watch this line climb toward 100% over the next few refreshes — that's the pipeline degrading gracefully instead of throwing 500s. Bring Redis back —"* (`docker start redis` / `docker compose up -d redis`) *"— and it recovers on its own, no restart needed anywhere else."*
+
+**2:15 — Throughput + alert mix (20s).** *"Throughput over the last 30 minutes, and the alert mix by channel and MCC group — which spend categories and card-present-vs-not patterns are actually driving the queue right now."*
+
+**2:35 — Close on cost and teardown (25s).** *"Everything you just watched runs entirely local — Docker Compose, `make demo`, $0. The same stack has an optional Terraform module to put this dashboard behind a public URL on Azure SQL serverless + Container Apps for about $1.50–2.50 a day while it's up, and it tears down cleanly with one command — same discipline as the rest of this project: nothing runs, and nothing bills, when nobody's looking at it."*
+
 ## How to Deploy (Azure)
 
 ```bash
@@ -119,10 +168,14 @@ Event Hubs **Standard** tier (required for the Kafka-compatible endpoint) is the
 - **Serving:** Flask 3.0.3 + gunicorn, Prometheus metrics (`/metrics`), soft-dependency Redis (never 500s on Redis failure — falls back to `cold_card: true`)
 - **Analytics:** dbt-duckdb 1.8.3 (DuckDB target locally over the sample CSV; models portable to Databricks SQL)
 - **IaC:** Terraform (`azurerm` provider) — Event Hubs, ACR, Log Analytics, Container Apps environment/app; `terraform destroy` tested as part of the Definition of Done
-- **Containerization:** Docker (`docker/docker-compose.yml` for local dev, separate `Dockerfile.api` / `Dockerfile.pipeline` images), Azure Container Apps for cloud deployment
+- **Containerization:** Docker (`docker/docker-compose.yml` for local dev, separate `Dockerfile.api` / `Dockerfile.pipeline` / `Dockerfile.dashboard` images), Azure Container Apps for cloud deployment
 - **Governance:** JSON-Schema data contract (`contracts/`), producer + in-stream re-validation with DLQ/quarantine dead-letter paths, salted-SHA-256 PAN tokenization, dbt tests as quality gates, data-dictionary/lineage/tokenization-policy docs (`docs/governance/`)
+- **System-of-record:** Azure SQL Edge (ARM-native, SQL Server-compatible) for `bank.*` — customers/accounts/cards dims plus `scored_transactions`/`fraud_alerts`, seeded deterministically from the sample CSV via Faker (seed=42); see `docs/adr/0002-bank-scorer-dashboard.md`
+- **Live scorer loop:** `src/pipeline/scorer.py` — a Kafka consumer that calls the same `/score` endpoint the benchmark measures and writes results/alerts to the bank DB, keeping one single scoring code path
+- **Dashboard:** Plotly Dash (pure Python, no CDN) fraud-ops console — live feed, alert queue with Confirm/Dismiss actions, latency/throughput/cold-card charts, `docker/Dockerfile.dashboard`
 
 ## What I'd Improve Next
+- **CDC from the bank DB instead of CSV replay.** The current ingestion path replays a static CSV onto Kafka; the production-real version of this pipeline would run Debezium CDC against `bank.*` (or an equivalent OLTP core-banking store) so `transactions` is a live change stream off the actual system of record, not a simulated replay. Scoped as v1.2 in `docs/tickets/11-cdc-ingestion.md`.
 - **Warm-Redis latency benchmark.** The only latency number in this README today is the cold-path (every card missing from Redis) baseline — the number that actually matters for production capacity planning is steady-state, with realistic Redis hit rates.
 - **dbt-over-DuckDB vs. a real warehouse.** The dbt project reads the sample CSV directly (via DuckDB's `read_csv_auto`), and `stg_transactions.sql` hand-mirrors `ingestion.py::to_event()`'s mapping logic in SQL rather than sharing one implementation — SQL can't import the Python module, so the two can drift if one changes without the other. On Databricks SQL, this staging model would instead read the same Delta tables the streaming job already writes, eliminating the duplication entirely.
 - **Single-node streaming.** Redpanda and the Spark job both run as single instances locally; there's no tested failover/rebalance story, and Spark's `foreachBatch` Redis writes are not currently idempotent under retry (a replayed microbatch after a crash could double-count a window's contribution if the same batch is retried non-atomically).
