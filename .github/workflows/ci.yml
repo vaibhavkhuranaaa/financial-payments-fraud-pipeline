@@ -31,3 +31,6 @@ jobs:
 
       - name: Build pipeline image
         run: docker build -f docker/Dockerfile.pipeline -t fraud-pipeline:ci .
+
+      - name: Build dashboard image
+        run: docker build -f docker/Dockerfile.dashboard -t fraud-dashboard:ci .
