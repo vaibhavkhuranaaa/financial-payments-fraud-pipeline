@@ -173,3 +173,46 @@ def test_schema_sql_guards_every_table_with_if_not_exists() -> None:
 
     # batches are GO-separated (sqlcmd convention consumed by db.run_script)
     assert sql_text.count("\nGO\n") >= 5
+
+
+@patch("src.bank.db.create_engine")
+def test_bootstrap_creates_database_when_missing(mock_create_engine: MagicMock) -> None:
+    from src.bank import db
+
+    conn = mock_create_engine.return_value.connect.return_value.__enter__.return_value
+    conn.execute.return_value.scalar.return_value = None  # DB_ID lookup: absent
+
+    db.bootstrap_database()
+
+    executed = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert any("CREATE DATABASE" in sql for sql in executed)
+    assert not any("DROP DATABASE" in sql for sql in executed)
+
+
+@patch("src.bank.db.create_engine")
+def test_bootstrap_drops_and_recreates_suspect_database(mock_create_engine: MagicMock) -> None:
+    # An unclean shutdown can leave the demo DB SUSPECT (found live
+    # 2026-07-19); bootstrap must drop the carcass and recreate, not wedge.
+    from src.bank import db
+
+    conn = mock_create_engine.return_value.connect.return_value.__enter__.return_value
+    conn.execute.return_value.scalar.return_value = "SUSPECT"
+
+    db.bootstrap_database()
+
+    executed = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert any("DROP DATABASE" in sql for sql in executed)
+    assert any("CREATE DATABASE" in sql for sql in executed)
+
+
+@patch("src.bank.db.create_engine")
+def test_bootstrap_leaves_online_database_alone(mock_create_engine: MagicMock) -> None:
+    from src.bank import db
+
+    conn = mock_create_engine.return_value.connect.return_value.__enter__.return_value
+    conn.execute.return_value.scalar.return_value = "ONLINE"
+
+    db.bootstrap_database()
+
+    executed = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert not any("DROP DATABASE" in sql or "CREATE DATABASE" in sql for sql in executed)

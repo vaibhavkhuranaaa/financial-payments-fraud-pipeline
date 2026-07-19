@@ -69,9 +69,24 @@ def bootstrap_database() -> None:
     engine = create_engine(url, pool_pre_ping=True, future=True, isolation_level="AUTOCOMMIT")
     try:
         with engine.connect() as conn:
-            conn.execute(
-                text(f"IF DB_ID(N'{BANK_DB_NAME}') IS NULL CREATE DATABASE [{BANK_DB_NAME}]")
-            )
+            # An unclean bank-db shutdown (e.g. teardown SIGKILLing SQL Edge
+            # mid-write) can leave the database SUSPECT/RECOVERY_PENDING, where
+            # every login "fails to open the explicitly specified database" and
+            # the whole demo wedges. This is disposable, deterministically
+            # re-seeded demo data — drop the carcass and start clean rather
+            # than attempting repair. Found live 2026-07-19.
+            state = conn.execute(
+                text("SELECT state_desc FROM sys.databases WHERE name = :name"),
+                {"name": BANK_DB_NAME},
+            ).scalar()
+            if state is not None and state != "ONLINE":
+                # Plain DROP (no SET OFFLINE first): a SUSPECT/RECOVERY_PENDING
+                # database has no sessions to roll back, and ALTER ... SET
+                # OFFLINE can itself fail on a database that can't be opened.
+                conn.execute(text(f"DROP DATABASE [{BANK_DB_NAME}]"))
+                state = None
+            if state is None:
+                conn.execute(text(f"CREATE DATABASE [{BANK_DB_NAME}]"))
     finally:
         engine.dispose()
 

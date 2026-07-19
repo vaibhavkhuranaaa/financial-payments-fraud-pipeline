@@ -120,6 +120,12 @@ services:
       MSSQL_SA_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
     ports:
       - "1433:1433"
+    # Compose's default 10s SIGTERM grace is not enough for SQL Edge to
+    # checkpoint and shut down cleanly under write load; a SIGKILL mid-write
+    # can leave the demo DB SUSPECT on the persisted volume (found live
+    # 2026-07-19 — bootstrap_database() also self-heals that case by
+    # dropping/recreating the disposable demo DB).
+    stop_grace_period: 90s
     volumes:
       - bank-db-data:/var/opt/mssql
     healthcheck:

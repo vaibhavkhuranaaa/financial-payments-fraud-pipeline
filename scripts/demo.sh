@@ -91,6 +91,26 @@ else
     ${OBS_SERVICES[@]+"${OBS_SERVICES[@]}"}
 fi
 
+# `compose up --wait` has been observed to exit 0 even when a one-shot
+# dependency (init-bank) failed and its dependents were left in Created —
+# so assert the long-running services are genuinely running before
+# declaring victory (found live 2026-07-19).
+critical=(scorer dashboard)
+if [[ "$CDC" == "1" ]]; then
+  critical+=(cdc-streamer cdc-transformer cdc-scan)
+fi
+if [[ "$OBS" == "1" ]]; then
+  critical+=(lag-exporter prometheus grafana)
+fi
+for svc in "${critical[@]}"; do
+  state="$(docker inspect -f '{{.State.Status}}' "$svc" 2>/dev/null || echo missing)"
+  if [[ "$state" != "running" ]]; then
+    echo "!! service '$svc' is '$state' (expected running) — demo did NOT come up cleanly" >&2
+    echo "   check: docker logs $svc  (and docker logs init-bank for seed failures)" >&2
+    exit 1
+  fi
+done
+
 echo "==> [4/4] demo is live"
 DASHBOARD_PORT="${DASHBOARD_PORT:-8050}"
 if [[ "$CDC" == "1" ]]; then
