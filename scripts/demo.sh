@@ -29,6 +29,16 @@ COMPOSE_FILE="docker/docker-compose.yml"
 COMPOSE=(docker compose -f "$COMPOSE_FILE")
 WAIT_TIMEOUT="${DEMO_WAIT_TIMEOUT:-180}"
 CDC="${CDC:-0}"
+OBS="${OBS:-0}"
+
+# OBS=1 layers the observability profile (ticket 13) onto either mode:
+# Prometheus + Grafana + lag exporter. Naming the services explicitly
+# activates their "obs" profile automatically (same mechanism the demo
+# already relies on for bank-db's "demo" profile).
+OBS_SERVICES=()
+if [[ "$OBS" == "1" ]]; then
+  OBS_SERVICES=(lag-exporter prometheus grafana)
+fi
 
 echo "==> [1/4] starting core services + bank DB (build as needed)"
 # Named explicitly (not via --profile) so this works regardless of which
@@ -65,8 +75,11 @@ if [[ "$CDC" == "1" ]]; then
   # Kafka directly in CDC mode: txn-writer INSERTs into
   # bank.card_transactions and cdc-streamer emits the change feed
   # (Debezium-shaped; see ADR 0003 for why not Debezium itself on SQL Edge).
+  # ${arr[@]+...} guard: macOS ships bash 3.2, where expanding an empty
+  # array under `set -u` is an unbound-variable error.
   "${COMPOSE[@]}" up -d --build --wait --wait-timeout "$WAIT_TIMEOUT" \
-    init-bank init-cdc cdc-scan cdc-streamer txn-writer cdc-transformer scorer dashboard
+    init-bank init-cdc cdc-scan cdc-streamer txn-writer cdc-transformer scorer dashboard \
+    ${OBS_SERVICES[@]+"${OBS_SERVICES[@]}"}
 else
   echo "==> [3/4] seeding bank DB + starting scorer, dashboard, replay producer"
   # init-bank is one-shot (depends_on bank-db healthy) and exits 0 once the
@@ -74,7 +87,8 @@ else
   # upserts deterministically). scorer depends_on init-bank completing
   # successfully, so compose sequences it automatically within this one `up`.
   "${COMPOSE[@]}" up -d --build --wait --wait-timeout "$WAIT_TIMEOUT" \
-    init-bank scorer dashboard producer
+    init-bank scorer dashboard producer \
+    ${OBS_SERVICES[@]+"${OBS_SERVICES[@]}"}
 fi
 
 echo "==> [4/4] demo is live"
@@ -104,5 +118,14 @@ Transactions are replaying onto Kafka and being scored continuously;
 give the dashboard ~10-20s to show its first live data.
 
 Stop everything with:  make demo-down
+EOF
+fi
+
+if [[ "$OBS" == "1" ]]; then
+  cat <<EOF
+Observability (OBS=1):
+  Grafana    : http://localhost:3000/d/fraud-ops  (anonymous viewer, provisioned as code)
+  Prometheus : http://localhost:9090  (/targets for scrape health, /alerts for rules)
+  Exporter   : http://localhost:9105/metrics  (consumer lag + bank freshness)
 EOF
 fi

@@ -24,23 +24,29 @@ tf-validate:
 compose-validate:
 	@if [ -f docker/docker-compose.yml ] && grep -q "services:" docker/docker-compose.yml; then docker compose -f docker/docker-compose.yml config -q ; else echo "compose not present yet — skipping"; fi
 
+# Observability overlay toggle (ticket 13): `make demo OBS=1` /
+# `make demo-cdc OBS=1` adds Prometheus + Grafana + the lag exporter to
+# either mode. Passed explicitly because make command-line vars are not
+# auto-exported to recipe environments.
+OBS ?= 0
+
 # One-command recruiter demo: core stack + bank DB + scorer loop + dashboard
 # + replay producer, topics created idempotently. See scripts/demo.sh.
 demo:
-	bash scripts/demo.sh
+	OBS=$(OBS) bash scripts/demo.sh
 
 # v1.2 CDC-mode demo: bank.card_transactions is the system of record,
 # Debezium streams its change feed onto Kafka, cdc-transformer maps it back
 # onto contract-v1 — see scripts/demo.sh.
 demo-cdc:
-	CDC=1 bash scripts/demo.sh
+	CDC=1 OBS=$(OBS) bash scripts/demo.sh
 
 # Tear down the demo stack (containers only — named volumes, e.g. the bank
 # DB's data, persist so re-running `make demo` is fast on a warm cache).
 demo-down:
-	docker compose -f $(COMPOSE_FILE) --profile demo --profile replay --profile cdc --profile debezium down
+	docker compose -f $(COMPOSE_FILE) --profile demo --profile replay --profile cdc --profile debezium --profile obs down
 
 # Same as demo-down but also drops named volumes (bank-db-data) for a fully
 # clean-state re-test.
 demo-down-volumes:
-	docker compose -f $(COMPOSE_FILE) --profile demo --profile replay --profile cdc --profile debezium down -v
+	docker compose -f $(COMPOSE_FILE) --profile demo --profile replay --profile cdc --profile debezium --profile obs down -v

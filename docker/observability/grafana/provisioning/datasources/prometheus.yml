@@ -1,0 +1,14 @@
+# Grafana datasource provisioning-as-code (ticket 13): the dashboard JSON
+# references this fixed uid, so nothing depends on clickops state.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s

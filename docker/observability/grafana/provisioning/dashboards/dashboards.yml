@@ -1,0 +1,14 @@
+# Grafana dashboard provisioning-as-code (ticket 13): loads every JSON in
+# /var/lib/grafana/dashboards (mounted from docker/observability/grafana/
+# dashboards/). Survives demo-down-volumes by construction — no UI state.
+apiVersion: 1
+
+providers:
+  - name: fraud-pipeline
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

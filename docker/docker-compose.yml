@@ -383,5 +383,74 @@ services:
       redpanda:
         condition: service_healthy
 
+  # --- Ticket 13 (v1.3) observability, profile "obs" ------------------------
+  # Opt-in overlay for either demo mode (`make demo OBS=1` / `make demo-cdc
+  # OBS=1`): Prometheus scrapes the api's existing /metrics plus the
+  # hand-rolled lag exporter; Grafana is fully provisioned as code (datasource
+  # + dashboard survive `demo-down-volumes` by construction). See ADR 0004.
+
+  # Consumer-lag + bank-freshness exporter (src/pipeline/lag_exporter.py):
+  # kafka_consumergroup_lag{group,topic,partition}, bank_rows_total{table},
+  # scoring_staleness_seconds on :9105 in Prometheus text format.
+  lag-exporter:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pipeline
+    container_name: lag-exporter
+    profiles: ["obs"]
+    command: ["src.pipeline.lag_exporter"]
+    ports:
+      - "9105:9105"
+    environment:
+      <<: *pipeline-env
+      LAG_EXPORTER_PORT: ${LAG_EXPORTER_PORT:-9105}
+      LAG_POLL_INTERVAL_S: ${LAG_POLL_INTERVAL_S:-5}
+      LAG_GROUPS: ${LAG_GROUPS:-scorer:transactions,cdc-transformer:bankdb.frauddemo.bank.card_transactions}
+      BANK_DB_HOST: bank-db
+      BANK_DB_PORT: 1433
+      BANK_DB_USER: sa
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      bank-db:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: prometheus
+    profiles: ["obs"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # Anonymous viewer is enabled for the demo (localhost-only stack); admin
+  # login stays admin/admin if editing is ever needed, but the dashboard is
+  # code — allowUiUpdates is off in the provisioning config.
+  grafana:
+    image: grafana/grafana-oss:11.1.0
+    container_name: grafana
+    profiles: ["obs"]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+
 volumes:
   bank-db-data:

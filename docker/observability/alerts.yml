@@ -1,0 +1,50 @@
+# Prometheus alert rules as code (ticket 13). No Alertmanager in v1.3 —
+# rules load and fire in the Prometheus UI (/alerts), which is enough for
+# the demo; routing/paging is a documented gap (ADR 0004).
+groups:
+  - name: fraud-pipeline
+    rules:
+      # The flagship signal: scoring is falling behind the stream. Fires
+      # during the kill-the-scorer demo, recovers after restart. 500 msgs at
+      # the demo's ~180-200 events/s is ~3s of backlog sustained for 2m —
+      # i.e. genuinely stuck, not a burst.
+      - alert: ConsumerLagHigh
+        expr: sum by (group) (kafka_consumergroup_lag) > 500
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Consumer group {{ $labels.group }} lag > 500 for 2m'
+          description: 'Committed offsets are falling behind the high watermark ({{ $value }} messages).'
+
+      # Freshness: nothing has landed in bank.scored_transactions for 60s
+      # while the stack is up. NaN (no rows yet) never satisfies >, so this
+      # stays quiet before first data.
+      - alert: ScoringStale
+        expr: scoring_staleness_seconds > 60
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'No new scored transactions for over 60s'
+          description: 'Newest bank.scored_transactions.scored_at is {{ $value }}s old.'
+
+      # Scrape-level liveness for both instrumented services.
+      - alert: TargetDown
+        expr: up{job=~"api|lag-exporter"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Scrape target {{ $labels.job }} is down'
+          description: 'Prometheus has failed to scrape {{ $labels.instance }} for 1m.'
+
+      # The exporter is up but one of its backends (kafka / bankdb) isn't.
+      - alert: ExporterBackendDown
+        expr: lag_exporter_target_up == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Lag exporter cannot reach {{ $labels.target }}'
+          description: 'lag_exporter_target_up{target="{{ $labels.target }}"} has been 0 for 1m.'
