@@ -1,6 +1,8 @@
 # Shared image for the replay producer and the Spark Structured Streaming
 # feature job. Same image, different `command:` override in docker-compose.
-FROM python:3.11-slim
+# Digest-pinned (ticket 14); tag kept in the comment for human reference.
+# python:3.11-slim
+FROM python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93
 
 # PySpark needs a JRE. eclipse-temurin JDK17 is the closest supported runtime
 # per docs/adr/0001 (Python 3.11 pinned venv note). Use Debian's default

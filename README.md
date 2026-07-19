@@ -92,13 +92,15 @@ cd financial-payments-fraud-pipeline
 python scripts/get_data.py --all   # optional if you only need the committed sample
 
 # 2. Bring up the core stack: Redpanda (Kafka), Redis, Spark streaming job, API
-docker compose -f docker/docker-compose.yml up --build
+# (--env-file supplies the demo-only secrets in docker/demo.env — see
+# docs/governance/security-posture.md)
+docker compose -f docker/docker-compose.yml --env-file docker/demo.env up --build
 
 # 3. Create the topics (first run only — rpk in current images has no auto-create flag)
 docker exec redpanda rpk topic create transactions transactions.dlq
 
 # 4. In a second terminal, replay the sample CSV onto Kafka (opt-in profile)
-docker compose -f docker/docker-compose.yml --profile replay up producer
+docker compose -f docker/docker-compose.yml --env-file docker/demo.env --profile replay up producer
 
 # 5. Score a transaction
 curl -X POST http://localhost:8000/score -H 'Content-Type: application/json' -d '{...}'
@@ -203,6 +205,9 @@ Event Hubs **Standard** tier (required for the Kafka-compatible endpoint) is the
 - **System-of-record:** Azure SQL Edge (ARM-native, SQL Server-compatible) for `bank.*` — customers/accounts/cards dims plus `scored_transactions`/`fraud_alerts`, seeded deterministically from the sample CSV via Faker (seed=42); see `docs/adr/0002-bank-scorer-dashboard.md`
 - **Live scorer loop:** `src/pipeline/scorer.py` — a Kafka consumer that calls the same `/score` endpoint the benchmark measures and writes results/alerts to the bank DB, keeping one single scoring code path
 - **Dashboard:** Plotly Dash (pure Python, no CDN) fraud-ops console — live feed, alert queue with Confirm/Dismiss actions, latency/throughput/cold-card charts, `docker/Dockerfile.dashboard`
+
+## Security
+Secrets have no baked-in fallback in `docker-compose.yml`/`src/bank/db.py`/`src/pipeline/ingestion.py` — `docker/demo.env` (committed, clearly marked demo-only) is the one place the local-dev values live, and a demo credential in use is logged as a `WARNING` at startup. CI runs `pip-audit` (non-blocking first pass) and a Trivy filesystem+config scan (gated on CRITICAL/HIGH) over the repo, Dockerfiles, compose, and Terraform; base images are digest-pinned. Full writeup, including what's deliberately demo-grade (`sa` user, no in-cluster TLS, no Key Vault yet) and the threat model: `docs/governance/security-posture.md`.
 
 ## What I'd Improve Next
 - **Schema registry + typed events.** Events are loose JSON validated against a JSON-Schema contract at each boundary; the next step is Avro/Protobuf with a schema registry (Redpanda ships one) so contract evolution is enforced by the broker path itself rather than by convention. (CDC ingestion — the previous top item here — shipped in v1.2: `make demo-cdc`, ADR 0003.)

@@ -30,6 +30,7 @@ import argparse
 import csv
 import hashlib
 import json
+import logging
 import os
 import sys
 import time
@@ -42,6 +43,8 @@ from dotenv import load_dotenv
 from jsonschema import Draft202012Validator
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _SCHEMA_PATH = os.path.join(_REPO_ROOT, "contracts", "transaction.schema.json")
@@ -59,7 +62,15 @@ KAFKA_TOPIC_DLQ = os.environ.get("KAFKA_TOPIC_DLQ", "transactions.dlq")
 PRODUCER_EVENTS_PER_SEC = float(os.environ.get("PRODUCER_EVENTS_PER_SEC", "200"))
 PRODUCER_INPUT_CSV = os.environ.get("PRODUCER_INPUT_CSV", "data/sample/transactions_sample.csv")
 
-TOKENIZATION_SALT = os.environ.get("TOKENIZATION_SALT", "change-me-local-only")
+# Ticket 14: fallback is the same demo-only value committed in
+# docker/demo.env/.env.example, kept for local-dev ergonomics — but its use
+# is logged loudly so it can never silently end up pointed at anything
+# non-local.
+_DEMO_TOKENIZATION_SALT = "change-me-local-only"
+TOKENIZATION_SALT = os.environ.get("TOKENIZATION_SALT", _DEMO_TOKENIZATION_SALT)
+
+if TOKENIZATION_SALT == _DEMO_TOKENIZATION_SALT:
+    logger.warning("demo credential in use — not for production (TOKENIZATION_SALT)")
 
 # --- Reference data for merchant_country derivation -------------------------
 

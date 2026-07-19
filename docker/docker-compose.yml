@@ -1,10 +1,20 @@
 # Local dev stack for the fraud pipeline. Run from repo root:
-#   docker compose -f docker/docker-compose.yml up
+#   docker compose -f docker/docker-compose.yml --env-file docker/demo.env up
 # Producer is opt-in (profile "replay"):
-#   docker compose -f docker/docker-compose.yml --profile replay up producer
+#   docker compose -f docker/docker-compose.yml --env-file docker/demo.env --profile replay up producer
 #
 # Contexts are `..` (repo root) so Dockerfiles can COPY src/, contracts/, etc.
+# --env-file supplies the demo-only secrets in docker/demo.env — see
+# docs/governance/security-posture.md.
 name: fraud-pipeline
+
+# Ticket 14: secrets have no inline `:-default` fallback left in this file —
+# `${VAR:?msg}` fails `docker compose config` loudly instead of silently
+# defaulting. `docker/demo.env` (committed, demo-only) supplies the values
+# for local dev via `--env-file docker/demo.env` (Makefile/scripts/demo.sh)
+# and via each secret-using service's `env_file:` below.
+x-demo-env-file: &demo-env-file
+  - demo.env
 
 x-pipeline-env: &pipeline-env
   KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
@@ -17,13 +27,14 @@ x-pipeline-env: &pipeline-env
   REDIS_HOST: redis
   REDIS_PORT: 6379
   DELTA_ROOT: /app/data/delta
-  TOKENIZATION_SALT: ${TOKENIZATION_SALT:-change-me-local-only}
+  TOKENIZATION_SALT: ${TOKENIZATION_SALT:?TOKENIZATION_SALT is required (see docker/demo.env for local dev)}
   PRODUCER_EVENTS_PER_SEC: ${PRODUCER_EVENTS_PER_SEC:-200}
   PRODUCER_INPUT_CSV: ${PRODUCER_INPUT_CSV:-data/sample/transactions_sample.csv}
 
 services:
   redpanda:
-    image: redpandadata/redpanda:v24.2.4
+    # Digest-pinned (ticket 14); tag kept here for human reference: v24.2.4
+    image: redpandadata/redpanda@sha256:9b91885f3add2d9033724fad39f9dda3b0adda8084edcb57aa08d21f2868b6b6
     container_name: redpanda
     command:
       - redpanda
@@ -59,6 +70,7 @@ services:
       dockerfile: docker/Dockerfile.pipeline
     container_name: spark-features
     command: ["src.pipeline.features", "--run-stream"]
+    env_file: *demo-env-file
     environment:
       <<: *pipeline-env
     depends_on:
@@ -81,6 +93,7 @@ services:
         "src.pipeline.ingestion",
         "--input", "data/sample/transactions_sample.csv",
       ]
+    env_file: *demo-env-file
     environment:
       <<: *pipeline-env
     depends_on:
@@ -112,12 +125,14 @@ services:
   # Silicon can't run full mssql-server). Opt-in via the "demo" profile since
   # it isn't part of the v1.0 streaming path.
   bank-db:
-    image: mcr.microsoft.com/azure-sql-edge:latest
+    # Digest-pinned (ticket 14); tag kept here for human reference: latest
+    image: mcr.microsoft.com/azure-sql-edge@sha256:902628a8be89e35dfb7895ca31d602974c7bafde4d583a0d0873844feb1c42cf
     container_name: bank-db
     profiles: ["demo"]
+    env_file: *demo-env-file
     environment:
       ACCEPT_EULA: "1"
-      MSSQL_SA_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      MSSQL_SA_PASSWORD: ${BANK_DB_PASSWORD:?BANK_DB_PASSWORD is required (see docker/demo.env for local dev)}
     ports:
       - "1433:1433"
     # Compose's default 10s SIGTERM grace is not enough for SQL Edge to
@@ -153,13 +168,14 @@ services:
     container_name: init-bank
     profiles: ["demo"]
     command: ["src.bank.seed", "--input", "data/sample/transactions_sample.csv"]
+    env_file: *demo-env-file
     environment:
       BANK_DB_HOST: bank-db
       BANK_DB_PORT: 1433
       BANK_DB_USER: sa
-      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:?BANK_DB_PASSWORD is required (see docker/demo.env for local dev)}
       BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
-      TOKENIZATION_SALT: ${TOKENIZATION_SALT:-change-me-local-only}
+      TOKENIZATION_SALT: ${TOKENIZATION_SALT:?TOKENIZATION_SALT is required (see docker/demo.env for local dev)}
     depends_on:
       bank-db:
         condition: service_healthy
@@ -176,6 +192,7 @@ services:
     container_name: scorer
     profiles: ["demo"]
     command: ["src.pipeline.scorer"]
+    env_file: *demo-env-file
     environment:
       <<: *pipeline-env
       SCORE_URL: ${SCORE_URL:-http://api:8000/score}
@@ -184,7 +201,7 @@ services:
       BANK_DB_HOST: bank-db
       BANK_DB_PORT: 1433
       BANK_DB_USER: sa
-      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:?BANK_DB_PASSWORD is required (see docker/demo.env for local dev)}
       BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
     depends_on:
       api:
@@ -206,11 +223,12 @@ services:
     profiles: ["demo"]
     ports:
       - "${DASHBOARD_PORT:-8050}:8050"
+    env_file: *demo-env-file
     environment:
       BANK_DB_HOST: bank-db
       BANK_DB_PORT: 1433
       BANK_DB_USER: sa
-      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:?BANK_DB_PASSWORD is required (see docker/demo.env for local dev)}
       BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
       API_METRICS_URL: ${API_METRICS_URL:-http://api:8000/metrics}
       DASHBOARD_PORT: ${DASHBOARD_PORT:-8050}
@@ -233,11 +251,12 @@ services:
     container_name: init-cdc
     profiles: ["cdc"]
     command: ["src.bank.cdc", "--enable"]
+    env_file: *demo-env-file
     environment:
       BANK_DB_HOST: bank-db
       BANK_DB_PORT: 1433
       BANK_DB_USER: sa
-      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:?BANK_DB_PASSWORD is required (see docker/demo.env for local dev)}
       BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
     depends_on:
       init-bank:
@@ -252,11 +271,12 @@ services:
     container_name: cdc-scan
     profiles: ["cdc"]
     command: ["src.bank.cdc", "--scan"]
+    env_file: *demo-env-file
     environment:
       BANK_DB_HOST: bank-db
       BANK_DB_PORT: 1433
       BANK_DB_USER: sa
-      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:?BANK_DB_PASSWORD is required (see docker/demo.env for local dev)}
       BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
     depends_on:
       init-cdc:
@@ -271,12 +291,13 @@ services:
     container_name: txn-writer
     profiles: ["cdc"]
     command: ["src.bank.txn_writer", "--input", "data/sample/transactions_sample.csv"]
+    env_file: *demo-env-file
     environment:
       <<: *pipeline-env
       BANK_DB_HOST: bank-db
       BANK_DB_PORT: 1433
       BANK_DB_USER: sa
-      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:?BANK_DB_PASSWORD is required (see docker/demo.env for local dev)}
       BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
     depends_on:
       init-cdc:
@@ -300,13 +321,14 @@ services:
     container_name: cdc-streamer
     profiles: ["cdc"]
     command: ["src.pipeline.cdc_streamer"]
+    env_file: *demo-env-file
     environment:
       <<: *pipeline-env
       KAFKA_TOPIC_CDC: ${KAFKA_TOPIC_CDC:-bankdb.frauddemo.bank.card_transactions}
       BANK_DB_HOST: bank-db
       BANK_DB_PORT: 1433
       BANK_DB_USER: sa
-      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:?BANK_DB_PASSWORD is required (see docker/demo.env for local dev)}
       BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
     depends_on:
       init-cdc:
@@ -359,9 +381,10 @@ services:
     container_name: connect-init
     profiles: ["debezium"]
     command: ["src.pipeline.connect_register"]
+    env_file: *demo-env-file
     environment:
       CONNECT_URL: http://connect:8083
-      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:?BANK_DB_PASSWORD is required (see docker/demo.env for local dev)}
     depends_on:
       connect:
         condition: service_healthy
@@ -380,6 +403,7 @@ services:
     container_name: cdc-transformer
     profiles: ["cdc"]
     command: ["src.pipeline.cdc_transformer"]
+    env_file: *demo-env-file
     environment:
       <<: *pipeline-env
       KAFKA_TOPIC_CDC: ${KAFKA_TOPIC_CDC:-bankdb.frauddemo.bank.card_transactions}
@@ -407,6 +431,7 @@ services:
     command: ["src.pipeline.lag_exporter"]
     ports:
       - "9105:9105"
+    env_file: *demo-env-file
     environment:
       <<: *pipeline-env
       LAG_EXPORTER_PORT: ${LAG_EXPORTER_PORT:-9105}
@@ -415,7 +440,7 @@ services:
       BANK_DB_HOST: bank-db
       BANK_DB_PORT: 1433
       BANK_DB_USER: sa
-      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-LocalDev!Passw0rd}
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:?BANK_DB_PASSWORD is required (see docker/demo.env for local dev)}
       BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
     depends_on:
       redpanda:
@@ -424,7 +449,8 @@ services:
         condition: service_healthy
 
   prometheus:
-    image: prom/prometheus:v2.53.0
+    # Digest-pinned (ticket 14); tag kept here for human reference: v2.53.0
+    image: prom/prometheus@sha256:075b1ba2c4ebb04bc3a6ab86c06ec8d8099f8fda1c96ef6d104d9bb1def1d8bc
     container_name: prometheus
     profiles: ["obs"]
     ports:
@@ -442,7 +468,8 @@ services:
   # login stays admin/admin if editing is ever needed, but the dashboard is
   # code — allowUiUpdates is off in the provisioning config.
   grafana:
-    image: grafana/grafana-oss:11.1.0
+    # Digest-pinned (ticket 14); tag kept here for human reference: 11.1.0
+    image: grafana/grafana-oss@sha256:079600c9517b678c10cda6006b4487d3174512fd4c6cface37df7822756ed7a5
     container_name: grafana
     profiles: ["obs"]
     ports:

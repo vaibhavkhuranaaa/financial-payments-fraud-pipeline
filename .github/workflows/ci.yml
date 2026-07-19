@@ -34,3 +34,37 @@ jobs:
 
       - name: Build dashboard image
         run: docker build -f docker/Dockerfile.dashboard -t fraud-dashboard:ci .
+
+  # Ticket 14: dependency + config/IaC scanning. Separate job from `check`
+  # so a scan finding never blocks on/gets blocked by the app build, and so
+  # its non-blocking first pass (see README Security section for why) is
+  # visible as its own status check rather than buried in `check`'s log.
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Non-blocking first pass: requirements.txt is pinned but not yet on a
+      # patch-cadence, so a new CVE shouldn't fail every PR until there's a
+      # triage/waiver workflow — see README Security section.
+      - name: pip-audit (requirements.txt)
+        continue-on-error: true
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+
+      # Filesystem mode covers both dependency vulns and misconfigurations
+      # (Dockerfiles, compose, terraform, workflows) by parsing files on
+      # disk — no image build needed. Gated on CRITICAL/HIGH.
+      - name: Trivy scan (filesystem + config)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,config,secret
+          severity: CRITICAL,HIGH
+          exit-code: "1"

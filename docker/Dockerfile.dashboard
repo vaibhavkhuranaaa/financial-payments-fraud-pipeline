@@ -1,7 +1,9 @@
 # Plotly Dash fraud-ops dashboard — minimal image, dashboard-only deps
 # (no pyspark/delta-spark/confluent-kafka; mirrors Dockerfile.api's approach
 # of installing only the subset of requirements.txt this service needs).
-FROM python:3.11-slim
+# Digest-pinned (ticket 14); tag kept in the comment for human reference.
+# python:3.11-slim
+FROM python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl freetds-bin \

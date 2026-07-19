@@ -22,6 +22,7 @@ to it. Set `BANK_DB_NAME=master` to opt back into the pre-ticket-11 layout
 
 from __future__ import annotations
 
+import logging
 import os
 
 from dotenv import load_dotenv
@@ -29,15 +30,26 @@ from sqlalchemy import Engine, create_engine, text
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 # --- Env-driven configuration (defaults mirror .env.example) ---------------
+
+# Ticket 14: the fallback below is the same demo-only value committed in
+# docker/demo.env/.env.example, kept for local-dev ergonomics (no compose or
+# .env required to just `import src.bank.db`) — but its use is logged loudly
+# so it can never silently end up pointed at anything non-local.
+_DEMO_BANK_DB_PASSWORD = "LocalDev!Passw0rd"
 
 BANK_DB_HOST = os.environ.get("BANK_DB_HOST", "localhost")
 BANK_DB_PORT = int(os.environ.get("BANK_DB_PORT", "1433"))
 BANK_DB_USER = os.environ.get("BANK_DB_USER", "sa")
-BANK_DB_PASSWORD = os.environ.get("BANK_DB_PASSWORD", "LocalDev!Passw0rd")
+BANK_DB_PASSWORD = os.environ.get("BANK_DB_PASSWORD", _DEMO_BANK_DB_PASSWORD)
 # Dedicated user database (not `master`) so CDC (sp_cdc_enable_db) can be
 # enabled on it — see `bootstrap_database()`.
 BANK_DB_NAME = os.environ.get("BANK_DB_NAME", "frauddemo")
+
+if BANK_DB_PASSWORD == _DEMO_BANK_DB_PASSWORD:
+    logger.warning("demo credential in use — not for production (BANK_DB_PASSWORD)")
 
 def get_engine() -> Engine:
     """Build (but do not connect) a SQLAlchemy engine for the bank DB.

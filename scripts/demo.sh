@@ -26,7 +26,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 COMPOSE_FILE="docker/docker-compose.yml"
-COMPOSE=(docker compose -f "$COMPOSE_FILE")
+# Ticket 14: secrets have no inline compose fallback, so every invocation
+# needs demo.env's values for interpolation (`${VAR:?msg}`), not just for the
+# containers' own env.
+COMPOSE=(docker compose -f "$COMPOSE_FILE" --env-file docker/demo.env)
 WAIT_TIMEOUT="${DEMO_WAIT_TIMEOUT:-180}"
 CDC="${CDC:-0}"
 OBS="${OBS:-0}"

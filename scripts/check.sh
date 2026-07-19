@@ -54,7 +54,9 @@ fi
 
 echo "==> compose config"
 if [[ -f "$REPO_ROOT/docker/docker-compose.yml" ]] && grep -q "services:" "$REPO_ROOT/docker/docker-compose.yml"; then
-  docker compose -f "$REPO_ROOT/docker/docker-compose.yml" config -q
+  # Ticket 14: secrets have no inline compose fallback, so this needs
+  # demo.env's values for interpolation (`${VAR:?msg}`).
+  docker compose -f "$REPO_ROOT/docker/docker-compose.yml" --env-file "$REPO_ROOT/docker/demo.env" config -q
 else
   echo "compose not present yet — skipping"
 fi
