@@ -108,6 +108,8 @@ curl -X POST http://localhost:8000/score -H 'Content-Type: application/json' -d 
 
 - Copy `.env.example` to `.env` and adjust (`TOKENIZATION_SALT`, `PRODUCER_EVENTS_PER_SEC`, etc.) before running compose if you need non-default settings.
 - `make check` (lint + tests + dbt build + terraform validate + compose config validate) is the pre-push gate; see `Makefile`/`scripts/check.sh`.
+- Run `pre-commit install` once to wire up lint/format-on-commit and a pytest gate on push (`.pre-commit-config.yaml`).
+- `make smoke` brings up the full replay demo and asserts against it end-to-end (health, scoring, DB growth, dashboard — see `scripts/smoke.sh`), then always tears itself down; this is ticket 15's CI `e2e-smoke` job, run on-demand/weekly (see `.github/workflows/ci.yml` for why not every push).
 - To run the analytics layer standalone: `cd dbt && ../.venv/bin/dbt build --profiles-dir .` (builds against the committed sample CSV, no live services required).
 
 ## Run the Demo

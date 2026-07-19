@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Ticket 15: e2e-smoke (below) only ever runs off these two triggers, never
+  # push/pull_request — see that job's comment for why.
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC
 
 jobs:
   check:
@@ -68,3 +73,38 @@ jobs:
           scanners: vuln,config,secret
           severity: CRITICAL,HIGH
           exit-code: "1"
+
+  # Ticket 15: compose E2E smoke (scripts/smoke.sh) against the full replay
+  # demo stack — the one CI job that actually proves `make demo` works, not
+  # just that it lints/builds.
+  #
+  # NOT on every push/PR, by design: `bank-db` runs `mcr.microsoft.com/
+  # azure-sql-edge`, which this repo's own ADR 0002/docs/governance record as
+  # ARM-native — it is the image chosen specifically because it runs Apple
+  # Silicon/ARM without emulation, unlike full `mssql-server`. Its amd64
+  # variant is published but Microsoft has been retiring/deprecating Azure
+  # SQL Edge outright, so an amd64-only GH-hosted `ubuntu-latest` runner
+  # (no ARM runners on the free tier, and no QEMU/emulation layer set up
+  # here) has no maintained, healthy story for pulling and running that image
+  # — the opposite problem from ADR 0002's "mssql-server needs amd64
+  # emulation on ARM" tradeoff, but the same root cause: this stack's DB
+  # image is architecture-committed. Rather than ship a job that's
+  # green-but-fake (silently no-ops or hard-fails on every PR for an
+  # environment reason unrelated to the code change), this runs only on a
+  # manual `workflow_dispatch` or a weekly schedule, so a real regression is
+  # still caught within a week and a maintainer can trigger it on demand —
+  # and if GH-hosted amd64 turns out to run the image fine (untested from
+  # here; no live Docker daemon available while writing this), promoting it
+  # to `pull_request` is a one-line `if:` change.
+  e2e-smoke:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: make smoke
+        run: make smoke

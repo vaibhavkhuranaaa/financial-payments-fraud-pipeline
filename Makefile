@@ -1,4 +1,4 @@
-.PHONY: check lint test dbt-build tf-validate compose-validate fmt demo demo-cdc demo-down demo-down-volumes
+.PHONY: check lint test dbt-build tf-validate compose-validate fmt demo demo-cdc demo-down demo-down-volumes smoke
 
 VENV := .venv/bin
 COMPOSE_FILE := docker/docker-compose.yml
@@ -54,3 +54,11 @@ demo-down:
 # clean-state re-test.
 demo-down-volumes:
 	docker compose -f $(COMPOSE_FILE) --env-file $(COMPOSE_ENV_FILE) --profile demo --profile replay --profile cdc --profile debezium --profile obs down -v
+
+# Ticket 15: bounded, assertion-driven E2E smoke test. Brings up the replay
+# demo, asserts against the live stack (health, scoring, DB growth,
+# dashboard, and — with OBS=1 — Prometheus/lag-exporter), then always tears
+# down via demo-down-volumes (trap on EXIT, pass or fail). See
+# scripts/smoke.sh. This is the merge gate for ticket 15 — run it live.
+smoke:
+	SMOKE_OBS=$(OBS) bash scripts/smoke.sh

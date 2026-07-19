@@ -1,0 +1,38 @@
+# Pre-commit hooks (ticket 15). Install once with `pre-commit install`; the
+# local pytest hook is gated to the `push` stage (`pytest -q -x tests` is too
+# slow to run on every `git commit`) — see `default_install_hook_types` below,
+# which makes `pre-commit install` wire up both the commit-stage hooks and
+# the push-stage hook in one shot.
+default_install_hook_types: [pre-commit, pre-push]
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.7
+    hooks:
+      - id: ruff
+        args: [--fix]
+        stages: [pre-commit]
+      - id: ruff-format
+        stages: [pre-commit]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        stages: [pre-commit]
+      - id: end-of-file-fixer
+        stages: [pre-commit]
+      - id: check-yaml
+        stages: [pre-commit]
+      - id: check-json
+        stages: [pre-commit]
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest -q -x tests
+        entry: bash -c '.venv/bin/pytest -q -x tests 2>/dev/null || pytest -q -x tests'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
