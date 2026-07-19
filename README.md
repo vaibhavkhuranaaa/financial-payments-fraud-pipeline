@@ -140,6 +140,20 @@ One honest caveat, documented in [`docs/adr/0003-cdc-ingestion.md`](docs/adr/000
 
 *(Screenshot placeholder — drop a dashboard screen-share capture at `docs/img/dashboard.png` and reference it here: `![Fraud-ops dashboard](docs/img/dashboard.png)`)*
 
+### Observability mode — watching the pipeline, not just measuring it (v1.3)
+
+```bash
+make demo-cdc OBS=1     # or: make demo OBS=1
+```
+
+`OBS=1` layers a Prometheus + Grafana stack (compose profile `obs`) onto either demo mode, fully provisioned as code — datasource, dashboard JSON, and alert rules all live in [`docker/observability/`](docker/observability/), so there is zero clickops and nothing to lose on `make demo-down-volumes`:
+
+- **Grafana** ([http://localhost:3000/d/fraud-ops](http://localhost:3000/d/fraud-ops), anonymous viewer): consumer lag per group, scoring throughput and alert rate, p50/p95/p99 score latency from the API's histogram, scoring staleness, backend health.
+- **Prometheus** ([http://localhost:9090](http://localhost:9090)): scrapes the API's existing `/metrics` plus a hand-rolled exporter; alert rules as code (`ConsumerLagHigh`, `ScoringStale`, `TargetDown`, `ExporterBackendDown`) load and fire in the UI — no Alertmanager yet, a documented gap.
+- **Lag exporter** (`src/pipeline/lag_exporter.py`, [:9105/metrics](http://localhost:9105/metrics)): `kafka_consumergroup_lag{group,topic,partition}` (committed offset vs high watermark — deliberately hand-rolled, the mechanics are the point), `bank_rows_total{table}`, and `scoring_staleness_seconds` — so one target answers both "is Kafka backing up?" and "is anything landing in SQL?". Rationale in [`docs/adr/0004-observability.md`](docs/adr/0004-observability.md).
+
+The demo beat this exists for: `docker kill scorer` → watch the scorer group's lag line climb on the Grafana board while staleness rises (and the `ConsumerLagHigh` alert arms) → `docker start scorer` → lag drains visibly back to zero. That's v1.2's commit-after-flush delivery semantics, made observable.
+
 ### The 3-minute recruiter demo script
 
 A talk track for walking someone through `make demo` live, panel by panel.
