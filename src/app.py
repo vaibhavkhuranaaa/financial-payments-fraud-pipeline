@@ -11,6 +11,14 @@ model trained by ``src/pipeline/train.py``.
 Redis is a soft dependency: any failure to reach it (down, absent, slow)
 falls back to zero-valued window features and marks the response
 ``cold_card: true`` — the endpoint never 500s because of Redis.
+
+Model versioning (ticket 17, v1.5b): ``MODEL_DIR`` may be either the flat
+legacy layout (``model.json``/``threshold.json``/``feature_columns.json``
+directly under it) or a versioned layout with a ``current.json`` pointer
+file selecting one of its ``<run_id>/`` subdirectories (written by
+``src/pipeline/train.py``); ``_resolve_model_dir`` picks whichever applies
+and both ``/healthz`` and every ``/score`` response report the resolved
+``model_version`` (``None`` under the flat legacy layout).
 """
 
 from __future__ import annotations
@@ -80,6 +88,35 @@ def _validate_event(event: dict[str, Any]) -> str | None:
     first = errors[0]
     path = "/".join(str(p) for p in first.path) or "<root>"
     return f"{path}: {first.message}"
+
+
+def _resolve_model_dir(base_dir: str) -> tuple[str, str | None]:
+    """Resolve the directory to actually load model/threshold/feature_columns
+    from, plus the model_version to report (ticket 17, v1.5b).
+
+    `<base_dir>/current.json` -> `{"run_id": ...}` selects a versioned run
+    dir `<base_dir>/<run_id>/` written by `src.pipeline.train`. No pointer
+    file, an unreadable one, or one naming a run dir that doesn't exist on
+    disk all fall back to the flat `base_dir` layout with `model_version =
+    None` — the pre-ticket-17 committed artifacts keep serving unchanged.
+    """
+    pointer_path = os.path.join(base_dir, "current.json")
+    if os.path.exists(pointer_path):
+        try:
+            with open(pointer_path, encoding="utf-8") as f:
+                run_id = json.load(f).get("run_id")
+        except (OSError, json.JSONDecodeError):
+            run_id = None
+        if run_id:
+            run_dir = os.path.join(base_dir, str(run_id))
+            if os.path.isdir(run_dir):
+                return run_dir, str(run_id)
+            logger.warning(
+                "current.json points at missing run dir %s; falling back to flat %s layout",
+                run_dir,
+                base_dir,
+            )
+    return base_dir, None
 
 
 def _load_model(model_dir: str) -> xgb.Booster | None:
@@ -170,24 +207,48 @@ def create_app(
     threshold: float | None = None,
     feature_columns: list[str] | None = None,
     redis_client: redis.Redis | None = None,
+    model_version: str | None = _UNSET,
 ) -> Flask:
     """Flask application factory.
 
-    All four dependencies are optional overrides so tests can inject a tiny
+    All dependencies are optional overrides so tests can inject a tiny
     in-memory Booster / fake Redis client without touching disk or network;
     production (gunicorn) calls `create_app()` with no arguments and loads
     everything from `MODEL_DIR` / `SCORE_THRESHOLD_PATH` / env once at
-    startup. `model` uses a sentinel default (rather than `None`) so tests can
-    pass `model=None` explicitly to exercise the "model missing" path without
-    it falling back to loading the real model from `MODEL_DIR`.
+    startup. `model` and `model_version` use a sentinel default (rather than
+    `None`) so tests can pass `model=None` / `model_version=None` explicitly
+    without it falling back to disk resolution.
+
+    `model_version` (ticket 17, v1.5b): when any of model/threshold/
+    feature_columns is loaded from disk, `MODEL_DIR` is resolved via
+    `_resolve_model_dir` — a `<MODEL_DIR>/current.json` pointer selects a
+    versioned run dir and its run_id becomes the reported model_version;
+    with no pointer (or a stale one), the flat legacy `MODEL_DIR` layout is
+    used and model_version is None. `SCORE_THRESHOLD_PATH` keeps working
+    exactly as before when explicitly overridden away from its default
+    (`<MODEL_DIR>/threshold.json`); left at the default, it follows the
+    resolved dir like model.json/feature_columns.json do.
     """
     app = Flask(__name__)
 
-    app.config["MODEL"] = _load_model(MODEL_DIR) if model is _UNSET else model
-    app.config["THRESHOLD"] = threshold if threshold is not None else _load_threshold(SCORE_THRESHOLD_PATH)
-    app.config["FEATURE_COLUMNS"] = (
-        feature_columns if feature_columns is not None else _load_feature_columns(MODEL_DIR)
+    needs_disk_resolution = model is _UNSET or threshold is None or feature_columns is None
+    if needs_disk_resolution:
+        resolved_dir, resolved_version = _resolve_model_dir(MODEL_DIR)
+    else:
+        resolved_dir, resolved_version = MODEL_DIR, None
+
+    app.config["MODEL"] = _load_model(resolved_dir) if model is _UNSET else model
+    default_threshold_path = os.path.join(MODEL_DIR, "threshold.json")
+    threshold_path = (
+        SCORE_THRESHOLD_PATH
+        if SCORE_THRESHOLD_PATH != default_threshold_path
+        else os.path.join(resolved_dir, "threshold.json")
     )
+    app.config["THRESHOLD"] = threshold if threshold is not None else _load_threshold(threshold_path)
+    app.config["FEATURE_COLUMNS"] = (
+        feature_columns if feature_columns is not None else _load_feature_columns(resolved_dir)
+    )
+    app.config["MODEL_VERSION"] = resolved_version if model_version is _UNSET else model_version
     app.config["REDIS_CLIENT"] = redis_client if redis_client is not None else _build_redis_client()
 
     @app.after_request
@@ -200,7 +261,13 @@ def create_app(
     def healthz() -> tuple[Response, int]:
         model_loaded = current_app.config["MODEL"] is not None
         status_code = 200 if model_loaded else 503
-        return jsonify({"status": "ok" if model_loaded else "unavailable", "model_loaded": model_loaded}), status_code
+        return jsonify(
+            {
+                "status": "ok" if model_loaded else "unavailable",
+                "model_loaded": model_loaded,
+                "model_version": current_app.config["MODEL_VERSION"],
+            }
+        ), status_code
 
     @app.route("/metrics", methods=["GET"])
     def metrics() -> Response:
@@ -241,6 +308,7 @@ def create_app(
                 "threshold": threshold,
                 "cold_card": cold_card,
                 "latency_ms": latency_ms,
+                "model_version": current_app.config["MODEL_VERSION"],
             }
         ), 200
 

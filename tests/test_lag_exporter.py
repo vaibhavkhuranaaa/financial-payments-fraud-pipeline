@@ -172,3 +172,46 @@ class TestUpdateOnceRendering:
         assert 'lag_exporter_poll_errors_total{target="kafka"} 1.0' in text
         assert 'bank_rows_total{table="scored_transactions"} 10.0' in text
         assert 'lag_exporter_target_up{target="bankdb"} 1.0' in text
+
+
+class TestMaybeUpdateDrift:
+    """model_psi gauges (ticket 17, v1.5b) — opt-in, wired via
+    maybe_update_drift rather than into update_once, so the always-on
+    Kafka/bank poll cycle's tests (above) stay untouched by this feature."""
+
+    def _reference(self):
+        from src.pipeline import drift
+
+        return drift.build_reference_stats(
+            __import__("pandas").DataFrame({"mcc": [1] * 900 + [2] * 100}),
+            numeric_features=[],
+            categorical_features=["mcc"],
+        )
+
+    def test_sets_model_psi_gauge_and_marks_target_up(self):
+        registry = CollectorRegistry()
+        metrics = lag_exporter.build_metrics(registry)
+        engine = MagicMock()
+        conn = engine.connect.return_value.__enter__.return_value
+        conn.execute.return_value.fetchall.return_value = [(10.0, 1, "chip")] * 90 + [(10.0, 2, "chip")] * 10
+
+        lag_exporter.maybe_update_drift(metrics, engine, self._reference(), limit=100)
+
+        text = generate_latest(registry).decode()
+        assert 'model_psi{feature="mcc"}' in text
+        assert 'lag_exporter_target_up{target="drift"} 1.0' in text
+
+    def test_drift_check_failure_is_isolated_not_fatal(self):
+        registry = CollectorRegistry()
+        metrics = lag_exporter.build_metrics(registry)
+        engine = MagicMock()
+        engine.connect.side_effect = RuntimeError("db down")
+
+        lag_exporter.maybe_update_drift(metrics, engine, self._reference(), limit=100)
+
+        text = generate_latest(registry).decode()
+        assert 'lag_exporter_target_up{target="drift"} 0.0' in text
+        assert 'lag_exporter_poll_errors_total{target="drift"} 1.0' in text
+
+    def test_disabled_by_default_env_var(self):
+        assert lag_exporter.DRIFT_CHECK_INTERVAL_S == 0.0

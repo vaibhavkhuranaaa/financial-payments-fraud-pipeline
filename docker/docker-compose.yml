@@ -437,11 +437,18 @@ services:
       LAG_EXPORTER_PORT: ${LAG_EXPORTER_PORT:-9105}
       LAG_POLL_INTERVAL_S: ${LAG_POLL_INTERVAL_S:-5}
       LAG_GROUPS: ${LAG_GROUPS:-scorer:transactions,cdc-transformer:bankdb.frauddemo.bank.card_transactions}
+      # Drift detection (ticket 17, v1.5b): off (0) unless explicitly set —
+      # see docs/adr/0005-model-ops.md for why this stays opt-in.
+      DRIFT_CHECK_INTERVAL_S: ${DRIFT_CHECK_INTERVAL_S:-0}
+      DRIFT_CHECK_LIMIT: ${DRIFT_CHECK_LIMIT:-2000}
+      MODEL_DIR: /app/models
       BANK_DB_HOST: bank-db
       BANK_DB_PORT: 1433
       BANK_DB_USER: sa
       BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:?BANK_DB_PASSWORD is required (see docker/demo.env for local dev)}
       BANK_DB_NAME: ${BANK_DB_NAME:-frauddemo}
+    volumes:
+      - ../models:/app/models
     depends_on:
       redpanda:
         condition: service_healthy

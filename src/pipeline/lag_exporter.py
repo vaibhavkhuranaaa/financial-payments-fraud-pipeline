@@ -16,7 +16,13 @@ Prometheus text format on ``LAG_EXPORTER_PORT``:
 - ``scoring_staleness_seconds`` — seconds since the newest
   ``bank.scored_transactions.scored_at``; NaN until the first score lands.
 - ``lag_exporter_target_up{target}`` — 1/0 per polled backend (kafka,
-  bankdb), so Grafana can show *why* a panel went blank.
+  bankdb, and drift when enabled), so Grafana can show *why* a panel went
+  blank.
+- ``model_psi{feature}`` — Population Stability Index of a recent
+  ``bank.scored_transactions`` sample vs the serving model's training-time
+  reference distribution (``src.pipeline.drift``). Off by default: only
+  computed when ``DRIFT_CHECK_INTERVAL_S`` is set > 0 (ticket 17, v1.5b) —
+  see ADR 0005 for why this stays opt-in rather than always-on.
 
 Why hand-rolled rather than a stock kafka-exporter image: the point of this
 project is showing the mechanics (committed offset vs high watermark is two
@@ -66,6 +72,16 @@ LAG_GROUPS = os.environ.get(
     "LAG_GROUPS",
     "scorer:transactions,cdc-transformer:bankdb.frauddemo.bank.card_transactions",
 )
+
+# Drift check cadence (ticket 17, v1.5b): 0/unset (default) disables the
+# model_psi{feature} gauges entirely — the obs profile's behavior is
+# unchanged unless this is opted into. When > 0, a PSI check against
+# bank.scored_transactions runs on this interval (independent of, and
+# typically much slower than, LAG_POLL_INTERVAL_S).
+DRIFT_CHECK_INTERVAL_S = float(os.environ.get("DRIFT_CHECK_INTERVAL_S", "0"))
+DRIFT_CHECK_LIMIT = int(os.environ.get("DRIFT_CHECK_LIMIT", "2000"))
+
+MODEL_DIR = os.environ.get("MODEL_DIR", "models")
 
 KAFKA_TIMEOUT_S = 10.0
 
@@ -181,6 +197,13 @@ def build_metrics(registry: CollectorRegistry) -> dict[str, Any]:
             ["target"],
             registry=registry,
         ),
+        "model_psi": Gauge(
+            "model_psi",
+            "Population Stability Index of a recent scored-transaction feature vs its "
+            "training-time reference distribution (0 when DRIFT_CHECK_INTERVAL_S is unset).",
+            ["feature"],
+            registry=registry,
+        ),
     }
 
 
@@ -217,6 +240,34 @@ def update_once(
         metrics["poll_errors"].labels(target="bankdb").inc()
 
 
+def maybe_update_drift(
+    metrics: dict[str, Any],
+    engine: Engine,
+    reference_stats: dict[str, Any],
+    limit: int = DRIFT_CHECK_LIMIT,
+) -> None:
+    """One PSI check + `model_psi{feature}` gauge update (ticket 17, v1.5b).
+
+    Same failure-isolation pattern as `update_once`'s Kafka/bank blocks: a
+    drift-check failure (DB down, manifest gone) marks `target_up{target=
+    "drift"}` 0 and counts a poll error, it never takes down the exporter or
+    the other gauges. Imports `src.pipeline.drift` lazily so a process that
+    never enables drift checking (the default) never pays for pandas/DB
+    query-building work at import time.
+    """
+    from src.pipeline import drift
+
+    try:
+        psi_by_feature, _ = drift.check_drift(engine, reference_stats, limit=limit)
+        for feature, psi in psi_by_feature.items():
+            metrics["model_psi"].labels(feature=feature).set(psi)
+        metrics["target_up"].labels(target="drift").set(1)
+    except Exception as exc:  # noqa: BLE001 — exporter must outlive backend outages
+        logger.warning("drift check failed: %s", exc)
+        metrics["target_up"].labels(target="drift").set(0)
+        metrics["poll_errors"].labels(target="drift").inc()
+
+
 def main() -> None:
     from confluent_kafka import Consumer
 
@@ -238,15 +289,36 @@ def main() -> None:
     registry = CollectorRegistry()
     metrics = build_metrics(registry)
 
+    drift_reference: dict[str, Any] | None = None
+    if DRIFT_CHECK_INTERVAL_S > 0:
+        from src.pipeline import drift
+
+        drift_reference = drift.load_reference_stats(MODEL_DIR)
+        if drift_reference is None:
+            logger.warning(
+                "DRIFT_CHECK_INTERVAL_S=%.1f set but no drift reference found under %s; "
+                "model_psi gauges stay at their default until a versioned run with a "
+                "manifest.json is trained",
+                DRIFT_CHECK_INTERVAL_S,
+                MODEL_DIR,
+            )
+
     start_http_server(LAG_EXPORTER_PORT, registry=registry)
     logger.info(
-        "lag exporter serving :%d, polling every %.1fs for %s",
+        "lag exporter serving :%d, polling every %.1fs for %s (drift checks: %s)",
         LAG_EXPORTER_PORT,
         LAG_POLL_INTERVAL_S,
         group_topics,
+        f"every {DRIFT_CHECK_INTERVAL_S:.0f}s" if drift_reference is not None else "disabled",
     )
+    last_drift_check = 0.0
     while True:
         update_once(metrics, group_consumers, group_topics, engine)
+        if drift_reference is not None:
+            now = time.monotonic()
+            if now - last_drift_check >= DRIFT_CHECK_INTERVAL_S:
+                maybe_update_drift(metrics, engine, drift_reference)
+                last_drift_check = now
         time.sleep(LAG_POLL_INTERVAL_S)
 
 

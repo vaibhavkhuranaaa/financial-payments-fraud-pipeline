@@ -49,7 +49,7 @@ flowchart LR
     J -.->|"/metrics"| DASH
 ```
 
-Full lineage detail (including the DLQ/quarantine dead-letter paths, the bank-DB read/write paths, and exactly which module owns which mapping) is in [`docs/governance/lineage.md`](docs/governance/lineage.md). Field-level definitions — including the `bank.*` tables — are in [`docs/governance/data-dictionary.md`](docs/governance/data-dictionary.md). The data contract itself is [`contracts/transaction.schema.json`](contracts/transaction.schema.json). Key architecture decisions and their rationale are in [`docs/adr/0001-stack-and-architecture.md`](docs/adr/0001-stack-and-architecture.md) (core stack) and [`docs/adr/0002-bank-scorer-dashboard.md`](docs/adr/0002-bank-scorer-dashboard.md) (bank DB / scorer loop / dashboard), and [`docs/adr/0003-cdc-ingestion.md`](docs/adr/0003-cdc-ingestion.md) (CDC ingestion and delivery semantics).
+Full lineage detail (including the DLQ/quarantine dead-letter paths, the bank-DB read/write paths, and exactly which module owns which mapping) is in [`docs/governance/lineage.md`](docs/governance/lineage.md). Field-level definitions — including the `bank.*` tables — are in [`docs/governance/data-dictionary.md`](docs/governance/data-dictionary.md). The data contract itself is [`contracts/transaction.schema.json`](contracts/transaction.schema.json). Key architecture decisions and their rationale are in [`docs/adr/0001-stack-and-architecture.md`](docs/adr/0001-stack-and-architecture.md) (core stack) and [`docs/adr/0002-bank-scorer-dashboard.md`](docs/adr/0002-bank-scorer-dashboard.md) (bank DB / scorer loop / dashboard), [`docs/adr/0003-cdc-ingestion.md`](docs/adr/0003-cdc-ingestion.md) (CDC ingestion and delivery semantics), [`docs/adr/0004-observability.md`](docs/adr/0004-observability.md) (Prometheus/Grafana + lag exporter), and [`docs/adr/0005-model-ops.md`](docs/adr/0005-model-ops.md) (versioned model artifacts + PSI drift detection).
 
 ## Key Results
 
@@ -68,6 +68,23 @@ Trained on the full dataset (11.9M rows, 2013–2019, time-based train/valid/tes
 | Confusion matrix (tn/fp/fn/tp) | 2,290,089 / 87,226 / 2,611 / 568 |
 
 At a ~0.13% base rate, absolute precision is inherently low at any recall-bearing threshold; the ranking metrics (PR-AUC, precision@top-k) are the honest measure, and both improved ~8–34× over the v1 feature set after root-causing the near-empty 1m/10m/1h windows (TabFormer cards transact roughly daily).
+
+### Model ops: artifact versioning + drift detection (v1.5b)
+
+`python -m src.pipeline.train` now writes each run to `models/<run_id>/` (`run_id` = UTC
+timestamp + git short SHA) — `model.json`, `threshold.json`, `feature_columns.json`,
+`metrics.json`, and a `manifest.json` (training data range, row/class-balance counts,
+package versions, git SHA, seed, and PSI reference distributions) — and repoints
+`models/current.json` at it. `src/app.py` resolves that pointer at startup and reports
+the serving `model_version` in `/healthz` and every `/score` response (`null` under the
+pre-v1.5b flat layout, which still serves unchanged with no migration step). `python -m
+src.pipeline.drift --check` samples recent `bank.scored_transactions` rows, computes
+Population Stability Index per top feature (`amount`, `mcc`, `channel`) against the
+current run's reference distribution, prints a table, and exits non-zero above PSI 0.2;
+the same check runs periodically inside the lag exporter (opt-in via
+`DRIFT_CHECK_INTERVAL_S`, off by default) as `model_psi{feature}` gauges. Full rationale
+— including why plain-file versioning over an MLflow server — in
+[`docs/adr/0005-model-ops.md`](docs/adr/0005-model-ops.md).
 
 ### API latency (local, measured with `scripts/benchmark.py`)
 

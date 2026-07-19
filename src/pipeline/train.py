@@ -55,9 +55,12 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
+import platform
+import subprocess
 import sys
 from datetime import datetime, timezone
 from typing import Any
@@ -76,6 +79,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+from src.pipeline import drift
 from src.pipeline.features import (
     FEATURE_COLUMNS,
     build_feature_row,
@@ -100,10 +104,72 @@ MODEL_DIR = os.environ.get("MODEL_DIR", "models")
 LABEL_COL = "is_fraud"
 TIME_COL = "event_time"
 
+# Fixed training seed, recorded in every run's manifest.json for
+# reproducibility auditing (ticket 17).
+SEED = int(os.environ.get("TRAIN_SEED", "42"))
+
 # Above this input file size, train_model defaults to the vectorized fast
 # path (a cheap proxy for "large row count" that avoids pre-scanning the
 # whole file just to count lines). Override explicitly with --fast/--no-fast.
 FAST_PATH_SIZE_THRESHOLD_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+def _git_short_sha() -> str:
+    """Short git SHA of HEAD, or "nogit" outside a git checkout / on any
+    subprocess failure (e.g. a Docker build context with no .git dir)."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        sha = result.stdout.strip()
+        return sha or "nogit"
+    except (OSError, subprocess.SubprocessError):
+        return "nogit"
+
+
+def make_run_id(now: datetime | None = None, git_sha: str | None = None) -> str:
+    """UTC-timestamp + git-short-SHA run id, e.g. '20260719T181530Z-8db7a55'.
+
+    Sortable by construction (timestamp first) and collision-resistant
+    across the same commit (second-resolution timestamp).
+    """
+    now = now or datetime.now(timezone.utc)
+    sha = git_sha if git_sha is not None else _git_short_sha()
+    return f"{now.strftime('%Y%m%dT%H%M%SZ')}-{sha}"
+
+
+def _package_versions() -> dict[str, str]:
+    """Versions of the packages most likely to change model behavior across
+    runs, for manifest.json's reproducibility record."""
+    versions = {"python": platform.python_version()}
+    for pkg in ("xgboost", "pandas", "numpy", "scikit-learn"):
+        try:
+            versions[pkg] = importlib.metadata.version(pkg)
+        except importlib.metadata.PackageNotFoundError:
+            versions[pkg] = "unknown"
+    return versions
+
+
+def _drift_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """`amount` / `mcc` / `channel` columns for drift reference-building
+    (src.pipeline.drift), reconstructed from the already-built feature frame
+    rather than the raw CSV: `amount` and `mcc` are FEATURE_COLUMNS as-is,
+    and `channel` (the raw 'chip'/'swipe'/'online' string `bank.scored_
+    transactions.channel` also stores) is reconstructed from the one-hot
+    `is_cnp`/`is_chip`/`is_swipe` flags — exact inverse of `enrich()`'s
+    channel mapping, and valid for both the row-wise and vectorized paths
+    since those flags are always in FEATURE_COLUMNS.
+    """
+    channel = np.select(
+        [df["is_cnp"] == 1, df["is_chip"] == 1, df["is_swipe"] == 1],
+        ["online", "chip", "swipe"],
+        default="unknown",
+    )
+    return pd.DataFrame({"amount": df["amount"].to_numpy(), "mcc": df["mcc"].to_numpy(), "channel": channel})
 
 _CSV_USECOLS = [
     "User",
@@ -458,6 +524,7 @@ def _train_one_config(
     param_overrides: dict[str, Any],
     num_boost_round: int,
     early_stopping_rounds: int,
+    seed: int = SEED,
 ) -> tuple[xgb.Booster, dict[str, Any]]:
     """Train one XGBoost config, pick its F1-optimal validation threshold,
     and evaluate it on the (untouched-until-now) test split. Returns the
@@ -467,6 +534,7 @@ def _train_one_config(
         "eval_metric": "aucpr",
         "scale_pos_weight": scale_pos_weight,
         "tree_method": "hist",
+        "seed": seed,
         **param_overrides,
     }
     booster = xgb.train(
@@ -516,6 +584,8 @@ def train_model(
     since_year: int | None = None,
     until_year: int | None = None,
     fast: bool | None = None,
+    run_id: str | None = None,
+    set_current: bool = True,
 ) -> dict[str, Any]:
     """End-to-end: load -> features -> split -> train -> threshold -> persist.
 
@@ -525,7 +595,18 @@ def train_model(
     rows) and the row-wise reference path otherwise. Pass True/False to force
     a path regardless of input size.
 
-    Returns the metrics dict that is also written to models/metrics.json.
+    Artifacts (ticket 17, v1.5b) are written to a versioned run directory
+    `<model_dir>/<run_id>/` — model.json, threshold.json, feature_columns.json,
+    metrics.json, and manifest.json (provenance + the drift.py reference
+    distributions). `run_id` defaults to `make_run_id()` (UTC timestamp + git
+    short SHA); pass one explicitly for deterministic test fixtures. When
+    `set_current` (default True), `<model_dir>/current.json` is written to
+    point at this run — the pointer src.app and src.pipeline.drift resolve to
+    pick the serving/reference version. Any pre-existing flat `<model_dir>/
+    model.json` etc. (the pre-ticket-17 layout) are left untouched — they
+    keep serving as the fallback whenever no pointer/run dir resolves.
+
+    Returns the metrics dict that is also written to <run_dir>/metrics.json.
     """
     if fast is None:
         try:
@@ -619,13 +700,15 @@ def train_model(
 
     threshold = best_metrics["threshold"]
 
-    os.makedirs(model_dir, exist_ok=True)
-    booster.save_model(os.path.join(model_dir, "model.json"))
+    run_id = run_id or make_run_id()
+    run_dir = os.path.join(model_dir, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    booster.save_model(os.path.join(run_dir, "model.json"))
 
-    with open(os.path.join(model_dir, "threshold.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(run_dir, "threshold.json"), "w", encoding="utf-8") as f:
         json.dump({"threshold": threshold, "chosen_by": "max_f1_on_validation_pr_curve"}, f, indent=2)
 
-    with open(os.path.join(model_dir, "feature_columns.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(run_dir, "feature_columns.json"), "w", encoding="utf-8") as f:
         json.dump(FEATURE_COLUMNS, f, indent=2)
 
     metrics = {
@@ -658,6 +741,7 @@ def train_model(
         "since_year": since_year,
         "until_year": until_year,
         "fast_path_used": bool(fast),
+        "run_id": run_id,
     }
     if metrics["fraud_rate"]["test"] == 0.0 or metrics["fraud_rate"]["valid"] == 0.0:
         metrics["notes"] = (
@@ -677,8 +761,34 @@ def train_model(
         if isinstance(entry.get("roc_auc"), float) and math.isnan(entry["roc_auc"]):
             entry["roc_auc"] = None
 
-    with open(os.path.join(model_dir, "metrics.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(run_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
+
+    drift_reference = drift.build_reference_stats(_drift_frame(train_df))
+    manifest = {
+        "run_id": run_id,
+        "git_sha": run_id.rsplit("-", 1)[-1],
+        "trained_at": metrics["trained_at"],
+        "seed": SEED,
+        "input_path": input_path,
+        "since_year": since_year,
+        "until_year": until_year,
+        "fast_path_used": bool(fast),
+        "data_range": {
+            "min_event_time": str(df[TIME_COL].min()) if len(df) else None,
+            "max_event_time": str(df[TIME_COL].max()) if len(df) else None,
+        },
+        "row_counts": metrics["rows"],
+        "class_balance": metrics["fraud_rate"],
+        "package_versions": _package_versions(),
+        "drift_reference": drift_reference,
+    }
+    with open(os.path.join(run_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    if set_current:
+        with open(os.path.join(model_dir, "current.json"), "w", encoding="utf-8") as f:
+            json.dump({"run_id": run_id}, f, indent=2)
 
     return metrics
 
@@ -703,6 +813,18 @@ def main(argv: list[str] | None = None) -> None:
             f"Default: auto-select vectorized for inputs > {FAST_PATH_SIZE_THRESHOLD_BYTES // (1024 * 1024)}MB."
         ),
     )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Override the auto-generated run id (UTC timestamp + git short SHA).",
+    )
+    parser.add_argument(
+        "--no-set-current",
+        dest="set_current",
+        action="store_false",
+        default=True,
+        help="Write the versioned run dir but do not repoint <model-dir>/current.json at it.",
+    )
     args = parser.parse_args(argv)
 
     metrics = train_model(
@@ -711,7 +833,10 @@ def main(argv: list[str] | None = None) -> None:
         since_year=args.since_year,
         until_year=args.until_year,
         fast=args.fast,
+        run_id=args.run_id,
+        set_current=args.set_current,
     )
+    print(f"run_id={metrics['run_id']}")
     print(f"fast_path_used={metrics['fast_path_used']}")
     roc_auc = metrics["roc_auc"]
     roc_auc_str = f"{roc_auc:.4f}" if roc_auc is not None else "n/a (single class in test split)"
