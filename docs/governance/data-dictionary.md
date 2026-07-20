@@ -7,6 +7,8 @@ Two layers of fields flow through this pipeline:
 
 ## 1. Contract fields (`transactions` topic, data contract v1)
 
+**Wire format (v1.6):** `contracts/transaction.schema.json` (JSON-Schema) is the human-readable source of truth; `contracts/transaction.avsc` is *generated* from it (`scripts/gen_avro_schema.py`, CI-gated so the two can't drift) and is what actually travels on the wire — registry-framed Avro via Redpanda's schema registry (subject `transactions-value`, BACKWARD compatibility). Field names/types/nullability below apply to both representations; see `docs/adr/0006-avro-schema-registry.md` for the type-mapping rules (JSON-Schema `enum` → Avro `string`, not an Avro enum; nullable fields → `["null", T]` with `default: null`).
+
 | Field | Type | Source | Meaning |
 |---|---|---|---|
 | `schema_version` | string (const `"1.0.0"`) | producer-set | Data contract version this event conforms to. |

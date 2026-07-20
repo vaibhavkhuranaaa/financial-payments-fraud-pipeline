@@ -23,12 +23,13 @@ flowchart LR
     end
 
     subgraph Broker
-        C[["transactions" topic\nRedpanda local / Event Hubs cloud]]
-        C_DLQ[["transactions.dlq"]]
+        C[["transactions" topic\nAvro, Redpanda local / Event Hubs cloud]]
+        C_DLQ[["transactions.dlq (JSON)"]]
+        SR[("Schema Registry :8081\nsubject transactions-value\nBACKWARD")]
     end
 
     subgraph Stream["Spark Structured Streaming (features.py::run_stream)"]
-        D[Re-validate\n+ enrich()]
+        D[Strip Confluent frame\n+ from_avro + Re-validate\n+ enrich()]
         D_Q[(Delta _quarantine)]
         E[Windowed aggregates\nCARD_WINDOWS]
     end
@@ -67,7 +68,7 @@ flowchart LR
     end
 
     subgraph Scorer["Scorer loop (scorer.py, ticket 07)"]
-        SC["Kafka consumer\ngroup=scorer"]
+        SC["Kafka consumer\ngroup=scorer\nAvro-decode"]
     end
 
     subgraph Dash["Fraud-ops dashboard (Plotly Dash, ticket 08)"]
@@ -75,7 +76,8 @@ flowchart LR
     end
 
     A --> B --> C
-    B -. invalid rows .-> C_DLQ
+    B -.register/lookup.-> SR
+    B -. invalid rows / avro errors .-> C_DLQ
 
     A -->|CDC mode| TW
     TW -->|"batch INSERT\n(validated first;\ninvalid logged, no insert)"| CT
@@ -84,7 +86,8 @@ flowchart LR
     DBZ --> CDCTOPIC
     CDCTOPIC --> XF
     XF -->|"op c/r -> event\nkeyed by card_token"| C
-    XF -. invalid / unknown op .-> C_DLQ
+    XF -.register/lookup.-> SR
+    XF -. invalid / unknown op / avro error .-> C_DLQ
     C --> D
     D -. invalid .-> D_Q
     D --> E
@@ -107,6 +110,7 @@ flowchart LR
     SEED --> CARDS
 
     C --> SC
+    SC -.lookup.-> SR
     SC -->|"POST /score\n(same endpoint as J)"| J
     J -->|response| SC
     SC -->|insert, idempotent on event_id| SCORED
@@ -123,6 +127,7 @@ flowchart LR
 
 ## Key lineage facts
 
+- **The wire format is typed and registry-enforced (v1.6):** both producers of `transactions` (`ingestion.py`, `cdc_transformer.py`) serialize through the same `src/pipeline/schema_registry.py` helper against Redpanda's registry (subject `transactions-value`, BACKWARD compatibility), and the two consumers (`scorer.py`, `features.py`) decode against the same checked-in `contracts/transaction.avsc` — generated from, and CI-synced with, the JSON-Schema contract. The DLQ stays JSON on purpose (it's for humans debugging bad rows); a record that fails Avro serialization after passing contract validation is routed there too, counted separately from validation failures. See `docs/adr/0006-avro-schema-registry.md`.
 - **Single source of truth for feature *definitions*:** `src/pipeline/features.py` (`enrich()`, `CARD_WINDOWS`, `FEATURE_COLUMNS`) is imported by both the streaming job and the offline training builder — this is the train/serve-skew prevention mechanism (ADR 0001, decision 4).
 - **Single source of truth for event *mapping*:** `src/pipeline/ingestion.py::to_event()` is the only place raw TabFormer rows become contract-v1 events for the live streaming path. The dbt staging model (`stg_transactions.sql`) re-implements the same rules in SQL so `dbt build` can run standalone in CI against the committed sample CSV, without a live Kafka/Spark/Delta stack. **This is a hand-maintained duplication, not a shared library** — SQL can't import the Python module. If `to_event()`'s mapping rules change, `stg_transactions.sql` (and the `country_name_to_iso2`/`mcc_group` dbt macros) must be updated to match. See "What I'd Improve Next" in the README.
 - **CDC mode (v1.2) keeps one mapping and one contract:** `bank.txn_writer` reuses `to_event()` (imported, never reimplemented) to validate/tokenize *before* the INSERT into `bank.card_transactions`, and `cdc_transformer.py` re-validates the reconstructed event against the same JSON-Schema contract before producing to `transactions`. Downstream (Spark/scorer/API) is byte-identical between replay and CDC modes. Update/delete change events are skipped by design (authorizations are immutable); unknown ops and mapping failures go to the Kafka DLQ.

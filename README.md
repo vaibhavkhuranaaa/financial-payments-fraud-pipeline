@@ -14,16 +14,19 @@ Card-issuer fraud teams need a decision — approve or hold for review — in mi
 
 ```mermaid
 flowchart LR
-    A[TabFormer CSV] -->|replay mode| B["ingestion.py\nvalidate + tokenize"]
-    B --> C[["transactions"\nRedpanda / Event Hubs]]
-    B -. invalid .-> C_DLQ[["transactions.dlq"]]
+    A[TabFormer CSV] -->|replay mode| B["ingestion.py\nvalidate + tokenize\n+ Avro-encode"]
+    B --> C[["transactions" (Avro)\nRedpanda / Event Hubs]]
+    B -. invalid / avro error .-> C_DLQ[["transactions.dlq (JSON)"]]
+    SR[("Schema Registry\n:8081, subject\ntransactions-value")]
+    B -.register/lookup.-> SR
     A -->|CDC mode| TW["txn_writer.py\nsame mapping, INSERT into SQL"]
     TW --> CT[("bank.card_transactions\nsystem of record")]
     CT -->|"CDC change tables\n+ cdc_streamer.py"| CDCT[["bankdb.frauddemo.\nbank.card_transactions"]]
-    CDCT --> XF["cdc_transformer.py\nenvelope → contract-v1"]
+    CDCT --> XF["cdc_transformer.py\nenvelope → contract-v1\n+ Avro-encode"]
     XF --> C
-    XF -. invalid .-> C_DLQ
-    C --> D["features.py\nSpark Structured Streaming\nre-validate + enrich"]
+    XF -. invalid / avro error .-> C_DLQ
+    XF -.register/lookup.-> SR
+    C --> D["features.py\nSpark Structured Streaming\nstrip frame + from_avro\nre-validate + enrich"]
     D -. invalid .-> DQ[(Delta _quarantine)]
     D --> E[Windowed aggregates\n1h / 1d / 7d / 30d per card]
     E --> F[(Redis\nonline features)]
@@ -38,7 +41,8 @@ flowchart LR
     K --> L[fct_daily_fraud_rate]
     K --> N[fct_merchant_risk]
     K --> O[fct_channel_mix]
-    C --> S["scorer.py\nKafka consumer"]
+    C --> S["scorer.py\nKafka consumer\nAvro-decode"]
+    S -.lookup.-> SR
     S -->|"POST /score"| J
     J --> S
     S --> BDB[("bank-db\nAzure SQL Edge")]
@@ -49,7 +53,7 @@ flowchart LR
     J -.->|"/metrics"| DASH
 ```
 
-Full lineage detail (including the DLQ/quarantine dead-letter paths, the bank-DB read/write paths, and exactly which module owns which mapping) is in [`docs/governance/lineage.md`](docs/governance/lineage.md). Field-level definitions — including the `bank.*` tables — are in [`docs/governance/data-dictionary.md`](docs/governance/data-dictionary.md). The data contract itself is [`contracts/transaction.schema.json`](contracts/transaction.schema.json). Key architecture decisions and their rationale are in [`docs/adr/0001-stack-and-architecture.md`](docs/adr/0001-stack-and-architecture.md) (core stack) and [`docs/adr/0002-bank-scorer-dashboard.md`](docs/adr/0002-bank-scorer-dashboard.md) (bank DB / scorer loop / dashboard), [`docs/adr/0003-cdc-ingestion.md`](docs/adr/0003-cdc-ingestion.md) (CDC ingestion and delivery semantics), [`docs/adr/0004-observability.md`](docs/adr/0004-observability.md) (Prometheus/Grafana + lag exporter), and [`docs/adr/0005-model-ops.md`](docs/adr/0005-model-ops.md) (versioned model artifacts + PSI drift detection).
+Full lineage detail (including the DLQ/quarantine dead-letter paths, the bank-DB read/write paths, and exactly which module owns which mapping) is in [`docs/governance/lineage.md`](docs/governance/lineage.md). Field-level definitions — including the `bank.*` tables — are in [`docs/governance/data-dictionary.md`](docs/governance/data-dictionary.md). The data contract itself is [`contracts/transaction.schema.json`](contracts/transaction.schema.json). Key architecture decisions and their rationale are in [`docs/adr/0001-stack-and-architecture.md`](docs/adr/0001-stack-and-architecture.md) (core stack) and [`docs/adr/0002-bank-scorer-dashboard.md`](docs/adr/0002-bank-scorer-dashboard.md) (bank DB / scorer loop / dashboard), [`docs/adr/0003-cdc-ingestion.md`](docs/adr/0003-cdc-ingestion.md) (CDC ingestion and delivery semantics), [`docs/adr/0004-observability.md`](docs/adr/0004-observability.md) (Prometheus/Grafana + lag exporter), [`docs/adr/0005-model-ops.md`](docs/adr/0005-model-ops.md) (versioned model artifacts + PSI drift detection), and [`docs/adr/0006-avro-schema-registry.md`](docs/adr/0006-avro-schema-registry.md) (Avro + Redpanda schema registry, typed events).
 
 ## Key Results
 
@@ -85,6 +89,14 @@ the same check runs periodically inside the lag exporter (opt-in via
 `DRIFT_CHECK_INTERVAL_S`, off by default) as `model_psi{feature}` gauges. Full rationale
 — including why plain-file versioning over an MLflow server — in
 [`docs/adr/0005-model-ops.md`](docs/adr/0005-model-ops.md).
+
+### Typed events: Avro + schema registry (v1.6)
+
+The `transactions` topic carries registry-framed Avro, not loose JSON. `contracts/transaction.avsc` is *generated* from `contracts/transaction.schema.json` (`scripts/gen_avro_schema.py`, CI-gated so the two can never silently drift), producers (`ingestion.py`, `cdc_transformer.py`) serialize through `confluent_kafka.schema_registry.avro.AvroSerializer` against Redpanda's built-in registry (`:8081`, subject `transactions-value`), and the scorer decodes with the matching `AvroDeserializer`. Spark's OSS `from_avro` has no registry integration, so `features.py` strips the 5-byte Confluent frame itself and decodes against the same checked-in schema (`spark-avro_2.12` added to `spark.jars.packages`) — the honest asymmetry documented in [`docs/adr/0006-avro-schema-registry.md`](docs/adr/0006-avro-schema-registry.md), decision 2.
+
+Live-verified end to end (2026-07-20), both demo modes: `make smoke` passed with Avro on the wire (231,567 → 236,567 rows in `bank.scored_transactions` over 20s); a targeted live check confirmed 791,471 events correctly `from_avro`-decoded into Delta `events` (only 1 row in `_quarantine`, a downstream business-rule reject, not a decode failure); CDC-mode's `cdc_transformer.py` produced 29,400 Avro-framed events onto `transactions` under the same registered schema id, zero landing in the DLQ. Subject compatibility is enforced BACKWARD, proven live: registering a schema with a new required field and no default returns **HTTP 409** with the registry's own incompatibility detail. One bug this live pass caught that hermetic unit tests structurally couldn't (no JVM in the test env): `features.py` initially built the frame-strip with `F.substring(col, pos, len)`, whose `pos`/`len` must be plain Python ints in PySpark 3.5 — a `Column`-typed length (`total_length - 5`) raised `PySparkTypeError` on every `spark-features` startup; fixed with `Column.substr()`, which does accept `Column` arguments, and re-verified live.
+
+Full CDC-mode dashboard-live check (the API + Dash UI panels, not just the Kafka wire format) was not run this session: the host's `:8000` was held by an unrelated project's container during verification. The wire-format and delivery-semantics claims above are proven directly against the broker/registry, independent of the dashboard.
 
 ### API latency (local, measured with `scripts/benchmark.py`)
 
@@ -234,7 +246,7 @@ Event Hubs **Standard** tier (required for the Kafka-compatible endpoint) is the
 - **Analytics:** dbt-duckdb 1.8.3 (DuckDB target locally over the sample CSV; models portable to Databricks SQL)
 - **IaC:** Terraform (`azurerm` provider) — Event Hubs, ACR, Log Analytics, Container Apps environment/app; `terraform destroy` tested as part of the Definition of Done
 - **Containerization:** Docker (`docker/docker-compose.yml` for local dev, separate `Dockerfile.api` / `Dockerfile.pipeline` / `Dockerfile.dashboard` images), Azure Container Apps for cloud deployment
-- **Governance:** JSON-Schema data contract (`contracts/`), producer + in-stream re-validation with DLQ/quarantine dead-letter paths, salted-SHA-256 PAN tokenization, dbt tests as quality gates, data-dictionary/lineage/tokenization-policy docs (`docs/governance/`)
+- **Governance:** JSON-Schema data contract (`contracts/transaction.schema.json`) as the human source of truth, with a generated, CI-synced Avro schema (`contracts/transaction.avsc`) enforced on the wire via Redpanda's schema registry (BACKWARD compatibility, subject `transactions-value`); producer + in-stream re-validation with DLQ/quarantine dead-letter paths, salted-SHA-256 PAN tokenization, dbt tests as quality gates, data-dictionary/lineage/tokenization-policy docs (`docs/governance/`)
 - **System-of-record:** Azure SQL Edge (ARM-native, SQL Server-compatible) for `bank.*` — customers/accounts/cards dims plus `scored_transactions`/`fraud_alerts`, seeded deterministically from the sample CSV via Faker (seed=42); see `docs/adr/0002-bank-scorer-dashboard.md`
 - **Live scorer loop:** `src/pipeline/scorer.py` — a Kafka consumer that calls the same `/score` endpoint the benchmark measures and writes results/alerts to the bank DB, keeping one single scoring code path
 - **Dashboard:** Plotly Dash (pure Python, no CDN) fraud-ops console — live feed, alert queue with Confirm/Dismiss actions, latency/throughput/cold-card charts, `docker/Dockerfile.dashboard`
@@ -243,7 +255,8 @@ Event Hubs **Standard** tier (required for the Kafka-compatible endpoint) is the
 Secrets have no baked-in fallback in `docker-compose.yml`/`src/bank/db.py`/`src/pipeline/ingestion.py` — `docker/demo.env` (committed, clearly marked demo-only) is the one place the local-dev values live, and a demo credential in use is logged as a `WARNING` at startup. CI runs `pip-audit` (non-blocking first pass) and a Trivy filesystem+config scan (gated on CRITICAL/HIGH) over the repo, Dockerfiles, compose, and Terraform; base images are digest-pinned. Full writeup, including what's deliberately demo-grade (`sa` user, no in-cluster TLS, no Key Vault yet) and the threat model: `docs/governance/security-posture.md`.
 
 ## What I'd Improve Next
-- **Schema registry + typed events.** Events are loose JSON validated against a JSON-Schema contract at each boundary; the next step is Avro/Protobuf with a schema registry (Redpanda ships one) so contract evolution is enforced by the broker path itself rather than by convention. (CDC ingestion — the previous top item here — shipped in v1.2: `make demo-cdc`, ADR 0003.)
+(Schema registry + typed events — the previous top item here — shipped in v1.6: registry-framed Avro on `transactions`, `make demo`/`make demo-cdc`, ADR 0006. CDC ingestion shipped in v1.2, ADR 0003.)
+- **Full CDC-mode dashboard-live re-verification.** v1.6's live checks proved the Avro wire format and BACKWARD-compat gate directly against the broker/registry in both modes; a full `make demo-cdc` pass with the API + dashboard up wasn't re-run this session (a local port conflict with an unrelated project, not a pipeline issue) — worth doing once, for completeness, alongside the next dashboard screenshot.
 - **Warm-Redis latency benchmark.** The only latency number in this README today is the cold-path (every card missing from Redis) baseline — the number that actually matters for production capacity planning is steady-state, with realistic Redis hit rates.
 - **dbt-over-DuckDB vs. a real warehouse.** The dbt project reads the sample CSV directly (via DuckDB's `read_csv_auto`), and `stg_transactions.sql` hand-mirrors `ingestion.py::to_event()`'s mapping logic in SQL rather than sharing one implementation — SQL can't import the Python module, so the two can drift if one changes without the other. On Databricks SQL, this staging model would instead read the same Delta tables the streaming job already writes, eliminating the duplication entirely.
 - **Single-node streaming.** Redpanda and the Spark job both run as single instances locally; there's no tested failover/rebalance story, and Spark's `foreachBatch` Redis writes are not currently idempotent under retry (a replayed microbatch after a crash could double-count a window's contribution if the same batch is retried non-atomically).
