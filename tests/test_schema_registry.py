@@ -2,12 +2,14 @@
 
 Hermetic — no live registry, no network. `registry_client`/`wait_for_registry`
 /`ensure_backward_compatibility` are exercised against a fake
-SchemaRegistryClient-shaped object; `build_avro_serializer` is exercised
-against the real `confluent_kafka.schema_registry.avro.AvroSerializer` (no
-network calls happen during construction or serialization for a
-reference-free schema) wired to that same fake client, so the produced bytes
-are genuine Confluent wire framing decodable with fastavro against the
-checked-in contracts/transaction.avsc.
+SchemaRegistryClient-shaped object; `build_avro_serializer`/
+`build_avro_deserializer` are exercised against the real
+`confluent_kafka.schema_registry.avro.AvroSerializer`/`AvroDeserializer` (no
+network calls happen during construction, serialization, or deserialization
+for a reference-free schema resolved from a schema_id already cached on the
+fake client) wired to that same fake client, so the produced/consumed bytes
+are genuine Confluent wire framing against the checked-in
+contracts/transaction.avsc.
 """
 
 from __future__ import annotations
@@ -63,6 +65,14 @@ class _FakeRegistryClient:
     def register_schema(self, subject_name, schema, normalize_schemas=False) -> int:
         self.registered_subjects.append(subject_name)
         return self.schema_id
+
+    def get_schema(self, schema_id: int):
+        """AvroDeserializer looks up the writer schema by id; every id in
+        these tests resolves to the same checked-in contract (no reference
+        fields, so this never needs a real registry round-trip)."""
+        from confluent_kafka.schema_registry import Schema
+
+        return Schema(sr._load_avro_schema_str(), schema_type="AVRO")
 
     def get_compatibility(self, subject_name=None) -> str:
         from confluent_kafka.schema_registry.error import SchemaRegistryError
@@ -169,3 +179,53 @@ def test_build_avro_serializer_round_trips_nullable_fields_null() -> None:
         avro_schema = fastavro.parse_schema(json.load(f))
     decoded = fastavro.schemaless_reader(io.BytesIO(payload), avro_schema)
     assert decoded == event
+
+
+# --- build_avro_deserializer / round-trip ---------------------------------
+
+
+def test_build_avro_deserializer_round_trips_serializer_output() -> None:
+    """The real AvroDeserializer, wired to the fake client, must decode
+    exactly what the real AvroSerializer (same fake client) produced —
+    the full round trip a live registry would also give scorer.py."""
+    from confluent_kafka.serialization import MessageField, SerializationContext
+
+    client = _FakeRegistryClient(schema_id=7)
+    serializer = sr.build_avro_serializer(client)
+    deserializer = sr.build_avro_deserializer(client)
+    ctx = SerializationContext("transactions", MessageField.VALUE)
+
+    raw = serializer(SAMPLE_EVENT, ctx)
+    decoded = deserializer(raw, ctx)
+
+    assert decoded == SAMPLE_EVENT
+
+
+def test_build_avro_deserializer_round_trips_nullable_fields_unset() -> None:
+    """Nullable fields (zip/errors/is_fraud) round-trip when set to null."""
+    from confluent_kafka.serialization import MessageField, SerializationContext
+
+    client = _FakeRegistryClient(schema_id=7)
+    serializer = sr.build_avro_serializer(client)
+    deserializer = sr.build_avro_deserializer(client)
+    ctx = SerializationContext("transactions", MessageField.VALUE)
+    event = dict(SAMPLE_EVENT, zip=None, errors=None, is_fraud=None)
+
+    raw = serializer(event, ctx)
+    decoded = deserializer(raw, ctx)
+
+    assert decoded == event
+
+
+def test_build_avro_deserializer_raises_on_garbage_bytes() -> None:
+    """A poison message (not registry-framed at all) must raise, not return
+    garbage — scorer.py relies on this to identify and skip it. Pinned to
+    the actual exception AvroDeserializer raises for a bad magic byte."""
+    from confluent_kafka.serialization import MessageField, SerializationContext, SerializationError
+
+    client = _FakeRegistryClient(schema_id=7)
+    deserializer = sr.build_avro_deserializer(client)
+    ctx = SerializationContext("transactions", MessageField.VALUE)
+
+    with pytest.raises(SerializationError):
+        deserializer(b"not-avro-framed-garbage", ctx)

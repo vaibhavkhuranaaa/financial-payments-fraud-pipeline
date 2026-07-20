@@ -16,7 +16,8 @@ This closes the demo loop: replay a CSV onto Kafka and the dashboard (ticket
 Testability
 -----------
 ``handle_event(event, session, engine, buffer)`` is broker-free: it takes a
-plain dict (what a Kafka message's JSON value decodes to), a ``requests``
+plain dict (what a Kafka message's registry-framed Avro value decodes to via
+``src/pipeline/schema_registry.py`` — ADR 0006), a ``requests``
 session, a SQLAlchemy engine, and a ``ScoreBuffer`` accumulator, and performs
 no Kafka calls itself. Tests drive it directly with mocked ``session``/
 ``engine`` and call ``flush`` explicitly. The confluent_kafka ``Consumer``
@@ -29,7 +30,6 @@ redelivery is absorbed by the event_id PK dedupe).
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import sys
@@ -297,9 +297,18 @@ def run(max_events: int | None) -> int:
     is durable in the bank DB. Redelivery after a crash is absorbed by the
     event_id PK dedupe on insert."""
     from confluent_kafka import Consumer
+    from confluent_kafka.serialization import MessageField, SerializationContext
+
+    from src.pipeline import schema_registry as sr
 
     consumer = Consumer(_consumer_config())
     consumer.subscribe([KAFKA_TOPIC_TRANSACTIONS])
+
+    # ADR 0006 decision 2: registry-framed Avro on `transactions` — wait for
+    # the registry before consuming, same as producers do at startup.
+    registry = sr.registry_client()
+    sr.wait_for_registry(registry)
+    avro_deserializer = sr.build_avro_deserializer(registry)
 
     session = requests.Session()
     engine = get_engine()
@@ -307,6 +316,7 @@ def run(max_events: int | None) -> int:
 
     consumed = 0
     scored = 0
+    poison_count = 0
     try:
         while max_events is None or consumed < max_events:
             msg = consumer.poll(1.0)
@@ -324,9 +334,16 @@ def run(max_events: int | None) -> int:
 
             consumed += 1
             try:
-                event = json.loads(msg.value())
-            except (json.JSONDecodeError, TypeError) as exc:
-                logger.warning("skipping unparseable message: %s", exc)
+                event = avro_deserializer(
+                    msg.value(), SerializationContext(KAFKA_TOPIC_TRANSACTIONS, MessageField.VALUE)
+                )
+            except Exception as exc:
+                # A poison message must not wedge the partition: log, count,
+                # skip. Its offset still advances through the normal
+                # commit-after-flush flow below (ADR 0003) — only the value
+                # decoding step changes here.
+                poison_count += 1
+                logger.warning("skipping undecodable message (poison #%d): %s", poison_count, exc)
                 continue
 
             if handle_event(event, session, engine, buffer):

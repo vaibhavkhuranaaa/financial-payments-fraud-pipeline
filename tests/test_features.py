@@ -1,11 +1,15 @@
 """Unit tests for src.pipeline.features: shared enrichment + windowed features.
 
-No Kafka/Redis/Spark required for the core tests. Anything that needs a real
-Spark session is marked `@pytest.mark.spark` and skipped if pyspark can't
-start in this environment, per the ticket's test-isolation requirement.
+Hermetic — no Kafka/Redis/Spark/registry required. The Avro wire-decode path
+(`from_avro` in `run_stream`, gated behind the spark-avro jar) is exercised by
+the E2E demo, not here (ticket 18 chunk T4); this file unit-tests the
+pure-Python pieces instead — schema-file loading and the frame-strip boundary
+math via fastavro against a real registry-framed payload.
 """
 
 from __future__ import annotations
+
+import json
 
 import numpy as np
 import pandas as pd
@@ -296,24 +300,70 @@ def test_build_feature_row_combines_enrichment_and_window_features() -> None:
         assert col in row
 
 
-@pytest.mark.spark
-def test_event_schema_builds_with_pyspark() -> None:
-    """Spark-dependent: only exercises schema construction, no cluster I/O."""
-    pyspark = pytest.importorskip("pyspark")
-    try:
-        from pyspark.sql import SparkSession
+def test_avro_schema_json_str_loads_checked_in_contract() -> None:
+    """`_avro_schema_json_str` (ADR 0006 decision 2) is what `run_stream`
+    hands to `from_avro` as the reader schema — pure file I/O + JSON parse,
+    no Spark session required. Replaces the old `_event_schema()` StructType
+    test: that hand-mirrored Spark schema is dead code now that from_avro
+    decodes against the checked-in contracts/transaction.avsc directly, so
+    there is no longer a second contract copy to test."""
+    import json as _json
 
-        SparkSession.builder.master("local[1]").appName("test").getOrCreate().stop()
-    except Exception as exc:  # noqa: BLE001 - environment-dependent Spark startup
-        pytest.skip(f"pyspark session could not start: {exc}")
+    from src.pipeline.features import _avro_schema_json_str
 
-    from src.pipeline.features import _event_schema
-
-    schema = _event_schema()
-    field_names = {f.name for f in schema.fields}
+    schema = _json.loads(_avro_schema_json_str())
+    field_names = {f["name"] for f in schema["fields"]}
     assert "card_token" in field_names
     assert "event_time" in field_names
-    _ = pyspark
+    assert "is_fraud" in field_names
+
+
+def test_avro_frame_strip_boundary_matches_confluent_framing() -> None:
+    """`run_stream` strips the 5-byte Confluent header (magic byte + 4-byte
+    big-endian schema id) via `substring(value, 6, length(value)-5)` before
+    handing the payload to `from_avro`. This pins that boundary math against
+    a real registry-framed message (built the same way `build_avro_serializer`
+    does) using fastavro directly, so the byte offsets are proven correct
+    without needing spark-avro or a live registry."""
+    import io
+    import struct
+
+    import fastavro
+
+    from src.pipeline.features import _avro_schema_json_str
+
+    schema = fastavro.parse_schema(json.loads(_avro_schema_json_str()))
+    event = {
+        "schema_version": "1.0.0",
+        "event_id": "b2b1c1a0-1111-4a2b-8c3d-0123456789ab",
+        "event_time": "2019-02-13T14:06:00Z",
+        "card_token": "a" * 64,
+        "user_id": "19",
+        "amount": 80.0,
+        "currency": "USD",
+        "channel": "chip",
+        "merchant_name": "-4282466774399734331",
+        "merchant_city": "Tucson",
+        "merchant_state": "AZ",
+        "merchant_country": "US",
+        "zip": "85719",
+        "mcc": 4829,
+        "errors": None,
+        "is_fraud": False,
+    }
+    buf = io.BytesIO()
+    buf.write(struct.pack(">bI", 0, 42))  # Confluent magic byte + schema id
+    fastavro.schemaless_writer(buf, schema, event)
+    framed = buf.getvalue()
+
+    # run_stream's Spark expr is substring(value, 6, length(value)-5), and
+    # Spark's substring is 1-indexed: substring(pos, len) == python[pos-1 : pos-1+len].
+    pos, length = 6, len(framed) - 5
+    stripped = framed[pos - 1 : pos - 1 + length]
+    assert stripped == framed[5:]  # boundary sanity check against the plain 0-indexed slice
+
+    decoded = fastavro.schemaless_reader(io.BytesIO(stripped), schema)
+    assert decoded == event
 
 
 def test_vectorized_matches_row_wise_on_sample(tmp_path) -> None:

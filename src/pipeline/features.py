@@ -576,31 +576,20 @@ def compute_card_features_vectorized(events_df: "pd.DataFrame") -> "pd.DataFrame
 
 # --- Spark Structured Streaming job (lazy pyspark import; not needed for tests) --
 
+_AVRO_SCHEMA_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "contracts",
+    "transaction.avsc",
+)
 
-def _event_schema():
-    """Explicit Spark schema mirroring contracts/transaction.schema.json."""
-    from pyspark.sql.types import BooleanType, DoubleType, IntegerType, StringType, StructField, StructType
 
-    return StructType(
-        [
-            StructField("schema_version", StringType(), True),
-            StructField("event_id", StringType(), True),
-            StructField("event_time", StringType(), True),
-            StructField("card_token", StringType(), True),
-            StructField("user_id", StringType(), True),
-            StructField("amount", DoubleType(), True),
-            StructField("currency", StringType(), True),
-            StructField("channel", StringType(), True),
-            StructField("merchant_name", StringType(), True),
-            StructField("merchant_city", StringType(), True),
-            StructField("merchant_state", StringType(), True),
-            StructField("merchant_country", StringType(), True),
-            StructField("zip", StringType(), True),
-            StructField("mcc", IntegerType(), True),
-            StructField("errors", StringType(), True),
-            StructField("is_fraud", BooleanType(), True),
-        ]
-    )
+def _avro_schema_json_str() -> str:
+    """Read the checked-in, CI-synced contracts/transaction.avsc (ADR 0006
+    decision 2) — the reader schema `from_avro` decodes against, replacing
+    the old hand-mirrored `_event_schema()` StructType as the single
+    source of truth for the wire shape."""
+    with open(_AVRO_SCHEMA_PATH, encoding="utf-8") as f:
+        return f.read()
 
 
 def _build_spark_session():
@@ -610,7 +599,8 @@ def _build_spark_session():
         SparkSession.builder.appName("fraud-pipeline-features")
         .config(
             "spark.jars.packages",
-            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,io.delta:delta-spark_2.12:3.2.0",
+            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,io.delta:delta-spark_2.12:3.2.0,"
+            "org.apache.spark:spark-avro_2.12:3.5.1",
         )
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
@@ -663,10 +653,11 @@ def run_stream(once: bool = False) -> None:  # pragma: no cover - requires a liv
     to Redis (online) + Delta (offline). `once=True` uses trigger(availableNow)
     for bounded runs (tests/smoke) instead of running forever.
     """
+    from pyspark.sql.avro.functions import from_avro
     from pyspark.sql import functions as F
 
     spark = _build_spark_session()
-    schema = _event_schema()
+    schema_json = _avro_schema_json_str()
 
     raw = (
         spark.readStream.format("kafka")
@@ -676,7 +667,14 @@ def run_stream(once: bool = False) -> None:  # pragma: no cover - requires a liv
         .load()
     )
 
-    parsed = raw.select(F.from_json(F.col("value").cast("string"), schema).alias("e")).select("e.*")
+    # ADR 0006 decision 2: OSS Spark's from_avro has no registry integration
+    # and doesn't understand Confluent wire framing — strip the 5-byte
+    # magic-byte + schema-id header manually, then decode against the
+    # checked-in reader schema. PERMISSIVE mode nulls out corrupt frames
+    # instead of failing the query; those rows are filtered below.
+    avro_payload = F.substring(F.col("value"), 6, F.length(F.col("value")) - 5)
+    decoded = raw.select(from_avro(avro_payload, schema_json, {"mode": "PERMISSIVE"}).alias("e"))
+    parsed = decoded.filter(F.col("e").isNotNull()).select("e.*")
 
     required_cols = [
         "event_id",

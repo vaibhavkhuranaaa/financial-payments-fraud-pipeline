@@ -85,6 +85,18 @@ def build_avro_serializer(client: Any) -> Any:
     return AvroSerializer(client, schema_str)
 
 
+def build_avro_deserializer(client: Any) -> Any:
+    """Build an AvroDeserializer for contract-v1 events using the checked-in
+    `contracts/transaction.avsc` as the reader schema (ADR 0006 decision 2:
+    Spark reads registry-framed messages against this same reader schema, so
+    the Python consumer path — scorer.py — does too, rather than trusting
+    the per-message writer schema alone)."""
+    from confluent_kafka.schema_registry.avro import AvroDeserializer
+
+    schema_str = _load_avro_schema_str()
+    return AvroDeserializer(client, schema_str)
+
+
 def ensure_backward_compatibility(client: Any, subject: str = TRANSACTIONS_SUBJECT) -> None:
     """Idempotently set/assert BACKWARD compatibility on `subject` (ADR 0006
     decision 3). Called once at producer startup; this is what later makes

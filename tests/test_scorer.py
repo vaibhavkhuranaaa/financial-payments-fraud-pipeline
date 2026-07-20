@@ -1,10 +1,14 @@
 """Unit tests for src.pipeline.scorer.
 
-Hermetic — no Kafka broker, no live DB, no live HTTP. `handle_event` is
-exercised directly with a fake Kafka-message-shaped dict, a mocked
-`requests.Session`, and a mocked SQLAlchemy engine; tests call `flush`
-explicitly (flush/commit ownership lives in `run()`, which is exercised with
-a fake confluent_kafka Consumer to pin the commit-after-flush ordering).
+Hermetic — no Kafka broker, no live DB, no live HTTP, no live schema
+registry. `handle_event` is exercised directly with a fake Kafka-message-
+shaped dict, a mocked `requests.Session`, and a mocked SQLAlchemy engine;
+tests call `flush` explicitly (flush/commit ownership lives in `run()`,
+which is exercised with a fake confluent_kafka Consumer to pin the
+commit-after-flush ordering). `run()`'s decode step is real registry-framed
+Avro (ADR 0006) built with the real `AvroSerializer`/`AvroDeserializer`
+wired to a fake, network-free registry client (`_FakeRegistryClient`,
+same shape as tests/test_schema_registry.py's).
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import pytest
 import requests
 from sqlalchemy.exc import IntegrityError
 
+from src.pipeline import schema_registry as sr
 from src.pipeline import scorer
 
 EVENT = {
@@ -253,6 +258,38 @@ def test_kafka_consumer_config_sets_group_and_offset_reset() -> None:
     assert config["enable.auto.commit"] is False
 
 
+class _FakeRegistryClient:
+    """Network-free stand-in for SchemaRegistryClient (mirrors
+    tests/test_schema_registry.py's fake): reachable, hands out a fixed
+    schema id, and resolves any schema id lookup to the checked-in contract
+    — enough for the real AvroSerializer/AvroDeserializer to round-trip
+    without ever touching a network."""
+
+    def __init__(self, schema_id: int = 1) -> None:
+        self.schema_id = schema_id
+
+    def get_subjects(self) -> list[str]:
+        return ["transactions-value"]
+
+    def register_schema(self, subject_name, schema, normalize_schemas=False) -> int:
+        return self.schema_id
+
+    def get_schema(self, schema_id: int):
+        from confluent_kafka.schema_registry import Schema
+
+        return Schema(sr._load_avro_schema_str(), schema_type="AVRO")
+
+
+def _avro_bytes(event: dict) -> bytes:
+    """Confluent-framed Avro bytes for `event`, built the same way
+    ingestion.py/cdc_transformer.py do — real wire format for run()'s fake
+    Consumer to feed the real AvroDeserializer."""
+    from confluent_kafka.serialization import MessageField, SerializationContext
+
+    serializer = sr.build_avro_serializer(_FakeRegistryClient())
+    return serializer(event, SerializationContext(scorer.KAFKA_TOPIC_TRANSACTIONS, MessageField.VALUE))
+
+
 class _FakeMessage:
     def __init__(self, payload: bytes) -> None:
         self._payload = payload
@@ -290,10 +327,8 @@ def test_run_commits_offsets_only_after_sql_flush() -> None:
     """The delivery-semantics boundary: with 60 messages and BATCH_SIZE=50,
     run() must flush-then-commit mid-stream at 50 rows, and flush-then-commit
     the 10-row remainder on shutdown — never commit before a flush."""
-    import json as _json
-
     log: list[str] = []
-    payload = _json.dumps(EVENT).encode("utf-8")
+    payload = _avro_bytes(EVENT)
     messages = [_FakeMessage(payload) for _ in range(60)]
 
     def fake_flush(engine, buffer) -> None:  # noqa: ANN001 — patch target
@@ -309,6 +344,7 @@ def test_run_commits_offsets_only_after_sql_flush() -> None:
     }
     with (
         patch("confluent_kafka.Consumer", lambda config: _FakeConsumer(messages, log)),
+        patch("src.pipeline.schema_registry.registry_client", return_value=_FakeRegistryClient()),
         patch("src.pipeline.scorer.get_engine", return_value=MagicMock()),
         patch("src.pipeline.scorer.score_event", return_value=score_response),
         patch("src.pipeline.scorer.flush", side_effect=fake_flush),
@@ -344,10 +380,8 @@ def test_run_flushes_subbatch_tail_on_idle_poll() -> None:
     """An idle stream must not strand a sub-batch tail: once the buffer's
     time threshold passes, a None poll flushes and commits it — messages
     alone never reach BATCH_SIZE here, so only the idle path can flush."""
-    import json as _json
-
     log: list[str] = []
-    payload = _json.dumps(EVENT).encode("utf-8")
+    payload = _avro_bytes(EVENT)
     # 3 messages (< BATCH_SIZE=50), then idle. should_flush() goes true only
     # via the buffer's (patched, immediate) time threshold on an idle poll.
     messages = [_FakeMessage(payload) for _ in range(3)]
@@ -372,6 +406,7 @@ def test_run_flushes_subbatch_tail_on_idle_poll() -> None:
 
     with (
         patch("confluent_kafka.Consumer", lambda config: _IdleConsumer(messages, log)),
+        patch("src.pipeline.schema_registry.registry_client", return_value=_FakeRegistryClient()),
         patch("src.pipeline.scorer.get_engine", return_value=MagicMock()),
         patch("src.pipeline.scorer.score_event", return_value=score_response),
         patch("src.pipeline.scorer.flush", side_effect=fake_flush),
@@ -386,3 +421,79 @@ def test_run_flushes_subbatch_tail_on_idle_poll() -> None:
     assert log[1] == "commit"
     assert log[-1] == "close"
     assert log.count("flush") == 1
+
+
+def test_run_decodes_confluent_framed_avro_messages() -> None:
+    """The consume loop's value-decoding step is registry-framed Avro now
+    (ADR 0006), not JSON: a genuine Confluent-framed message must reach
+    score_event as the same dict it was serialized from."""
+    log: list[str] = []
+    payload = _avro_bytes(EVENT)
+    messages = [_FakeMessage(payload)]
+    captured: list[dict] = []
+
+    def capturing_score_event(session, event):  # noqa: ANN001 — patch target
+        captured.append(event)
+        return {
+            "fraud_probability": 0.1,
+            "decision": "approve",
+            "threshold": 0.5,
+            "cold_card": False,
+            "latency_ms": 1.0,
+        }
+
+    def fake_flush(engine, buffer) -> None:  # noqa: ANN001 — patch target
+        log.append("flush")
+        buffer.mark_flushed()
+
+    with (
+        patch("confluent_kafka.Consumer", lambda config: _FakeConsumer(messages, log)),
+        patch("src.pipeline.schema_registry.registry_client", return_value=_FakeRegistryClient()),
+        patch("src.pipeline.scorer.get_engine", return_value=MagicMock()),
+        patch("src.pipeline.scorer.score_event", side_effect=capturing_score_event),
+        patch("src.pipeline.scorer.flush", side_effect=fake_flush),
+    ):
+        scored = scorer.run(max_events=1)
+
+    assert scored == 1
+    assert captured == [EVENT]
+
+
+def test_run_skips_poison_message_and_continues(caplog: pytest.LogCaptureFixture) -> None:
+    """A message that fails Avro decoding must not wedge the partition: it's
+    logged and skipped, but the surrounding good messages are still scored,
+    and shutdown still pairs exactly one flush with one commit — the poison
+    message's offset rides through the same commit-after-flush boundary
+    (ADR 0003) as every other consumed message, since `consumed` (and thus
+    the consumer's position) advances for it too."""
+    log: list[str] = []
+    good_bytes = _avro_bytes(EVENT)
+    messages = [_FakeMessage(good_bytes), _FakeMessage(b"not-avro-framed-garbage"), _FakeMessage(good_bytes)]
+
+    def fake_flush(engine, buffer) -> None:  # noqa: ANN001 — patch target
+        log.append("flush")
+        buffer.mark_flushed()
+
+    score_response = {
+        "fraud_probability": 0.1,
+        "decision": "approve",
+        "threshold": 0.5,
+        "cold_card": False,
+        "latency_ms": 1.0,
+    }
+    with (
+        patch("confluent_kafka.Consumer", lambda config: _FakeConsumer(messages, log)),
+        patch("src.pipeline.schema_registry.registry_client", return_value=_FakeRegistryClient()),
+        patch("src.pipeline.scorer.get_engine", return_value=MagicMock()),
+        patch("src.pipeline.scorer.score_event", return_value=score_response),
+        patch("src.pipeline.scorer.flush", side_effect=fake_flush),
+        caplog.at_level("WARNING"),
+    ):
+        scored = scorer.run(max_events=3)
+
+    # 2 good messages scored; the poison one is skipped, not counted as scored.
+    assert scored == 2
+    assert any("poison #1" in record.getMessage() for record in caplog.records)
+    # Shutdown flush+commit still pairs exactly once — the skip didn't
+    # trigger an extra flush or leave the boundary in a bad state.
+    assert log == ["flush", "commit", "close"]
