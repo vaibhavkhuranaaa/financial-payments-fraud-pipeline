@@ -672,7 +672,10 @@ def run_stream(once: bool = False) -> None:  # pragma: no cover - requires a liv
     # magic-byte + schema-id header manually, then decode against the
     # checked-in reader schema. PERMISSIVE mode nulls out corrupt frames
     # instead of failing the query; those rows are filtered below.
-    avro_payload = F.substring(F.col("value"), 6, F.length(F.col("value")) - 5)
+    # NOTE: F.substring()'s pos/len args must be plain ints in PySpark 3.5 —
+    # only Column.substr() accepts Column expressions for a data-dependent
+    # length like `total length - 5`.
+    avro_payload = F.col("value").substr(F.lit(6), F.length(F.col("value")) - 5)
     decoded = raw.select(from_avro(avro_payload, schema_json, {"mode": "PERMISSIVE"}).alias("e"))
     parsed = decoded.filter(F.col("e").isNotNull()).select("e.*")
 
