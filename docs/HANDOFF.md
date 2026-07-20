@@ -1,56 +1,137 @@
-# Handoff — post-v1.5 (2026-07-19)
+# Handoff — post-v1.6 (2026-07-20)
 
 > Read `docs/STATE.md` first (source of truth: phase table, environment facts, exact next step).
-> Repo state at handoff: everything pushed, `git status` clean, `make check` green (202 tests),
-> tags `v1.3`/`v1.4`/`v1.5` pushed, **no containers running**, $0 cloud spend, no AI co-author
-> trailers anywhere in history.
+> Repo state at handoff: everything pushed to `main` locally (push to remote not yet run — see
+> below), `git status` clean, `make check` green (242 tests), tag `v1.6` created, no containers
+> running, $0 cloud spend, no AI co-author trailers anywhere in history.
 
-## Session summary (2026-07-19 — v1.3, v1.4, v1.5 all shipped in one session)
+## Session summary (2026-07-20 — v1.6 shipped)
 
-Execution model: orchestrator (this session) wrote tickets + did all verification/gating; three
-Sonnet subagents implemented tickets 14/15/17 in isolated git worktrees; every diff was reviewed
-line-by-line by the orchestrator before squash-merge, and every merge gate was run live.
+Execution model: **fable-foreman orchestration.** The lead model wrote ADR 0006 directly
+(judgment work), then dispatched three Sonnet workers for the implementation chunks — each ran
+in the working tree, was reviewed diff-by-diff by the orchestrator, and was blind-verified by a
+fresh-context `foreman-verifier` (no access to the worker's reasoning, only the original task and
+the diff) before commit. All three verifiers returned `PASS`. Live E2E verification — the part
+no unit test or blind verifier could substitute for — was run directly by the orchestrator against
+a real Docker stack, per this project's own standing rule that live gates are never delegated.
 
-| Tag | Commits | What shipped |
-|---|---|---|
-| v1.3 | ba4cd0f, 6248038, d09511e, 88b7288, 6054a9d | **Observability** (ticket 13): hand-rolled lag exporter (`kafka_consumergroup_lag`, `bank_rows_total`, `scoring_staleness_seconds`, per-backend up/error), Prometheus + Grafana + alert rules fully as code under `docker/observability/`, compose profile `obs`, `make demo OBS=1` / `make demo-cdc OBS=1`. ADR 0004. Plus demo robustness found live: SUSPECT-DB self-heal in `bootstrap_database()`, bank-db `stop_grace_period: 90s`, demo.sh end-state assertion. |
-| v1.4 | 048ee1c, 32bdd0c | **Security hardening** (ticket 14): compose `${VAR:?}` fail-loud secrets + committed demo-only `docker/demo.env` (all compose invocations now take `--env-file docker/demo.env`), demo-credential startup WARNINGs, CI `security` job (pip-audit non-blocking + Trivy fs/config gated CRIT/HIGH), digest-pinned images, `docs/governance/security-posture.md`. **CI E2E smoke** (ticket 15): `scripts/smoke.sh` + `make smoke` (bounded asserts, unconditional teardown trap), `e2e-smoke` CI job on workflow_dispatch+weekly (azure-sql-edge is ARM-committed — honest gating, reasoning in ci.yml), pre-commit hooks. |
-| v1.5 | 239e07f, 1a806f3 | **Model ops** (ticket 17): versioned `models/<run_id>/` + manifest (data range, class balance, package versions, git SHA, drift reference stats) + `current.json` pointer, `model_version` in `/healthz`+`/score`, flat-layout fallback intact; `drift.py` PSI + `--check` CLI; `model_psi{feature}` gauges opt-in via `DRIFT_CHECK_INTERVAL_S`. ADR 0005. **Load/backpressure** (ticket 16): `make loadtest`; README "Load & backpressure" numbers. |
+| Commit | What shipped |
+|---|---|
+| cfcf6b0 | ADR 0006 (Avro, Confluent framing, BACKWARD compat, migration story, type mapping) |
+| a23fc16 | Schema foundation: `scripts/gen_avro_schema.py` (JSON-Schema → Avro, deterministic, `--check` CI gate), `contracts/transaction.avsc`, Redpanda schema registry enabled in compose (`:8081`/`:18081`), `fastavro` pinned |
+| a635e5a | Producers: `src/pipeline/schema_registry.py` helper, `ingestion.py` + `cdc_transformer.py` now emit registry-framed Avro; DLQ stays JSON; Avro-serialization failures counted separately from validation failures |
+| 9c1cb0c | Consumers: `scorer.py` Avro-decode (poison messages logged/counted/skipped, commit-after-flush untouched), `features.py` Spark `from_avro` + frame-strip, dead `_event_schema()` StructType removed |
+| b151edd | **Live-caught fix:** `F.substring()`'s `pos`/`len` must be plain ints in PySpark 3.5 — crashed `spark-features` on every startup; fixed with `Column.substr()` |
+| f825836, 122a70d | Docs: README/data-dictionary/lineage/CHANGELOG/STATE updated with live-verified numbers |
 
 **Live verifications this session (all real, none simulated):**
-- v1.3 kill test: `docker kill scorer` → lag 49 → 26,049, `ConsumerLagHigh` pending→**firing** at ~2m20s, staleness 146s; restart → drained to 49 in ~75s, alert auto-resolved. Both demo modes verified with the obs overlay.
-- `make smoke` full pass: stack up, `/healthz`+`/score` 200, scored rows 1,050→4,650 over 20s, dashboard 200, teardown left `docker ps` empty.
-- Drift check against live DB: amount PSI .076 ok / channel .125 ok / mcc **.322 DRIFT** with non-zero exit (expected: 2018+-slice reference vs full replay) — the detector detecting is the demo.
-- Load: saturation ~440 req/s (single API container), latency scales linearly with queueing, 0 errors in 42k requests; backpressure replay ~860 ev/s → scorer lag peak ~80k → drained to 0 in ~3.5 min on the Grafana board.
+- `make smoke` (replay mode): PASS, `bank.scored_transactions` 231,567 → 236,567 over 20s with Avro on the wire.
+- Targeted Spark check: real Confluent-framed bytes confirmed on `transactions` (`rpk topic consume`, magic byte + schema id); 791,471 events correctly `from_avro`-decoded into Delta `events`, 1 row in `_quarantine` (a business-rule reject, not a decode failure — proves decode succeeded).
+- BACKWARD-compatibility acceptance criterion: `GET /config/transactions-value` = `BACKWARD`; a schema with a new required field and no default → registry returns **HTTP 409** with `READER_FIELD_MISSING_DEFAULT_VALUE`.
+- Full CDC-mode E2E with API + dashboard live: all services healthy, `/healthz`+`/score` 200, dashboard 200, `bank.scored_transactions` 12,900 → 16,550 and `bank.fraud_alerts` 1,233 over 20s, `cdc_transformer.py` producing Avro under the same schema id as the replay producer, `transactions.dlq` at 0.
 
 ## What failed this session (read before trusting anything)
-1. **Unclean teardown genuinely corrupted the demo DB** — compose's default 10s grace SIGKILLed SQL Edge mid-write; `frauddemo` came back **SUSPECT**, every login failed (18456 state 38), and `compose up --wait` *still exited 0* with the scorer stuck in `Created`. Three fixes shipped (88b7288): `bootstrap_database()` drops+recreates any non-ONLINE demo DB (disposable data, deterministic re-seed — fingerprint unchanged `ff724846752b`), `stop_grace_period: 90s`, and demo.sh now asserts every long-running service is `running` before declaring victory. The self-heal was then exercised against the real corrupted volume and worked.
-2. **Subagent bug (ticket 15):** one-off DB queries via `compose run scorer python -c` silently became `python -m python -c` — the pipeline image's ENTRYPOINT is `python -m`. Caught in orchestrator review; fixed with `--entrypoint python`.
-3. **Portability bug (ticket 15):** `timeout` doesn't exist on stock macOS; smoke.sh died with exit 127. Fixed with a `with_timeout` fallback (GNU timeout → gtimeout → unwrapped). Related process lesson repeated from last session: **never pipe a gated command through `tail`** — the 127 was masked once by exactly that.
-4. **Worktree `.venv` symlink clobber (ticket 17):** the subagent's worktree contained a `.venv` symlink; `.gitignore`'s `.venv/` (trailing slash = dirs only) didn't match it, so it got committed and the squash-merge replaced the real venv with a self-referencing link. Venv rebuilt (`uv venv --python 3.11` + requirements + requirements-dev), `.gitignore` hardened to `.venv`. If tooling ever reports "Too many levels of symbolic links", it's this class of bug.
-5. **`v1.2` tag placement miss (prior session, unchanged):** `v1.2` points one commit before a test-hermeticity fix; moving a pushed tag is a user-approval item, left as-is.
+
+1. **Real bug, caught only by live verification, not by 242 green unit tests:**
+   `features.py`'s Confluent-frame-strip built `avro_payload = F.substring(F.col("value"), 6,
+   F.length(F.col("value")) - 5)` — `F.substring()`'s `pos`/`len` args must be plain Python ints
+   in PySpark 3.5.1; a `Column`-typed length raised `PySparkTypeError` and crash-looped
+   `spark-features` on every startup. Unit tests are hermetic by design (no JVM in the test env)
+   so this was structurally invisible to them — this is exactly why ticket 18's own spec
+   forbade tagging `v1.6` without a live E2E pass. Fixed with `Column.substr()`, which does
+   accept `Column` arguments for a data-dependent length; re-verified live post-fix
+   (791,471 correctly decoded rows).
+2. **Two local Docker/Kafka gotchas, not repo bugs, worth remembering:**
+   - Bypassing `scripts/demo.sh` and bringing up CDC services manually skips its topic
+     pre-creation step; `cdc_transformer.py` then logs transient `UNKNOWN_TOPIC_OR_PARTITION`
+     for ~30–45s until Redpanda's single-broker metadata converges after the topic is created.
+     Self-resolves; not a defect. Always let `demo.sh` create topics, or pre-create them
+     yourself before starting consumers if bringing services up piecemeal.
+   - Docker Compose (v2.24+) merges a service's `ports:` list across `-f` files by
+     **appending**, not replacing — a naive override file adds a second port mapping instead of
+     changing the first, which still collides. Use the `!override` YAML tag on the key to force
+     a full replace (see the local-port-conflict workaround below).
+3. **Host port 8000 was held by an unrelated project (`docker-app-1`,
+   `healthcare-sepsis-prediction`) plus an active SSH tunnel during this session.** Rather than
+   stop someone else's running container without asking, the orchestrator surfaced the conflict
+   to the user, who said "use another port." Fixed with a **local, uncommitted** compose override
+   (`docker/docker-compose.local-override.yml`, deleted after use, never staged/committed):
+   ```yaml
+   services:
+     api:
+       ports: !override
+         - "18000:8000"
+   ```
+   Brought the full stack up with `-f docker/docker-compose.yml -f docker/docker-compose.local-override.yml`,
+   ran every check against `localhost:18000` instead of `:8000`, then deleted the override file.
+   Repo/Makefile/CI are unaffected — this was a session-local workaround, not a code change.
 
 ## Roadmap — done vs remaining
-**Done:** v1.0 pipeline+API+Azure · v1.1 bank/scorer/dashboard · v1.2 CDC + delivery semantics · v1.3 observability · v1.4 security hardening + CI E2E smoke + pre-commit · v1.5 model ops + load testing. **Six of the seven items in the original industry-grade hardening roadmap are shipped.**
 
-**Remaining (exactly one feature item):**
-1. **Ticket 18 — schema registry + typed events (v1.6)**: Avro on `transactions` via Redpanda's built-in registry. Deliberately NOT started this session — its own spec forbids starting without budget to finish and E2E-verify BOTH demo modes (a half-migrated wire format is worse than validated JSON). Design constraints are pre-framed in the ticket; write ADR 0006 first.
-2. Housekeeping (small, optional): delete the three merged `worktree-agent-*` branches + `.claude/worktrees/` dirs (user-approval: branch deletion); consider moving `v1.2` (user-approval: tag move); Key Vault wiring in terraform remains a documented TODO (`security-posture.md`); Alertmanager/OTel/traces remain documented gaps (ADR 0004).
+**Done:** v1.0 pipeline+API+Azure · v1.1 bank/scorer/dashboard · v1.2 CDC + delivery semantics ·
+v1.3 observability · v1.4 security hardening + CI E2E smoke + pre-commit · v1.5 model ops + load
+testing · **v1.6 typed events (Avro + schema registry).** **All 7 items in the original
+industry-grade hardening roadmap are now shipped and live-verified.**
 
-Explicitly rejected (don't revisit without the user): graph/ring features. `docs/tickets/12-dual-stream.md` remains a stub pending user approval.
+**Remaining:** no approved backlog item exists. `docs/tickets/12-dual-stream.md` (dual
+auth/settlement streams) is a stub that needs a design pass and explicit user approval before
+any work starts; graph/ring features are explicitly rejected — don't revisit either without the
+user. Small housekeeping items carried from prior sessions, still untouched (all user-approval
+items, not urgent): delete the three merged `worktree-agent-*` branches +
+`.claude/worktrees/` dirs; consider moving the `v1.2` tag (it points one commit before a
+test-hermeticity fix); Key Vault wiring in Terraform remains a documented TODO
+(`security-posture.md`); Alertmanager/OTel/traces remain documented gaps (ADR 0004).
 
 ## Candid assessment: big-bank resume credibility
-**Verdict: yes — list it. As of v1.5 this is past "portfolio project with production shapes" and into "credible junior/mid platform-DE system," with one honest qualifier: it's still single-node everything and JSON-on-the-wire. Say "production-shaped, single-node, fully observable and tested demo with measured limits" — the numbers do the talking.**
+
+**Verdict: yes — list it, and it's stronger than the v1.5 assessment.** As of v1.6 this project
+has closed its own most-cited gap: the wire format is no longer "loose JSON, next step Avro" —
+it *is* Avro, registry-enforced, with a live-proven compatibility gate. Say "production-shaped,
+single-node, fully observable, typed, and tested demo with measured limits."
 
 Against real bars:
-- **Delivery guarantees — strong, and now *observable*.** At-least-once with commit-after-flush at every consumer, effectively-once in SQL via PK dedupe, proven by kill tests with exact row accounting (v1.2: 77,089/77,089, 0 dups) — and since v1.3 the failure mode is *visible*: the interview demo is killing the scorer live and watching lag spike, an alert fire, and recovery drain on a Grafana board provisioned entirely from code.
-- **Observability — was the biggest gap, now a strength.** Metrics (latency histograms, consumer lag, freshness, row counts, drift PSI), alert rules as code, dashboards as code, per-backend failure isolation in the exporter. Honest remaining gaps, documented in ADR 0004: no Alertmanager routing, no traces, no structured log shipping.
-- **Testing/CI — good, one honest asterisk.** 202 hermetic tests, contract validation at three boundaries, an E2E smoke that actually brings up the full stack and asserts data flow (passed live), pre-commit, dependency+config scanning gated on CRIT/HIGH. The asterisk: `e2e-smoke` runs weekly/on-demand in CI, not per-PR, because GH-hosted runners are amd64 and the DB image is ARM-committed — the workflow says so out loud instead of shipping a green-but-fake job, which is itself the right engineering answer.
-- **Security — structurally sound, operationally demo-grade, and *documented as exactly that*.** Fail-loud secrets with one committed demo-only env file, scanning in CI, digest-pinned images, tokenization policy, synthetic-only data. Still sa-user/no-TLS/no-Key-Vault locally — `security-posture.md` draws the hardened/demo-grade line explicitly, which is what a security reviewer actually wants to see.
-- **Ops maturity — measured, not just claimed.** Saturation point (~440 req/s), backpressure curve (80k lag, 3.5min drain), kill/restart recovery times, self-healing bootstrap after real corruption, one-command up/down/smoke. Missing for "bank-grade": HA (single broker/partition/replica everywhere), runbooks, capacity beyond a laptop, DR story.
-- **Model ops — now real:** versioned artifacts with full manifests, pointer-based serving with version reported per response, PSI drift detection that demonstrably fires, retrain recipe. No scheduled retraining or champion/challenger — fine to say so.
+- **Schema governance — was the honest gap, now closed.** A generated-and-CI-synced Avro schema,
+  a real schema registry enforcing BACKWARD compatibility (proven with a live 409, not asserted
+  in prose), and a documented, deliberate asymmetry (Spark reads with the repo's schema, not
+  per-message writer-schema resolution — OSS Spark's actual constraint, stated plainly in ADR
+  0006 rather than glossed over).
+- **Delivery guarantees — unchanged and still strong.** Commit-after-flush ordering was a hard
+  constraint on this ticket and was verified byte-for-byte unchanged in both producers and both
+  consumers; the migration touched serialization only.
+- **Engineering process — the ticket's own gate did its job.** The spec said "don't tag without
+  live E2E of both modes," and that gate caught a real crash-on-every-startup bug that 242 green
+  hermetic tests structurally could not see (no JVM in the test environment). That's the ticket's
+  design working exactly as intended, not a near-miss to gloss over.
+- **Judgment under a real external constraint.** A local port conflict with a genuinely unrelated
+  project was surfaced to the user instead of unilaterally killing someone else's container — and
+  once the user said "use another port," it was solved without touching the compose files that
+  ship in the repo (a local, uncommitted override, deleted after use).
+- Everything else from the v1.5 assessment (delivery semantics, observability, testing/CI,
+  security posture, ops maturity, model ops) is unchanged and still holds.
 
-What lands in an interview: every claim above has a measured number or a live demo behind it, every architectural decision has an ADR (including two genuine failure pivots — Debezium-on-Edge and this session's SUSPECT-DB corruption), and the whole loop shows in 3 minutes with `make demo-cdc OBS=1`. What would take it to genuinely senior: ticket 18 (typed events end-to-end), HA/multi-partition with a rebalance story, and per-PR E2E in CI on ARM runners.
+What would take it further: HA/multi-partition with a rebalance story, per-PR E2E on ARM
+runners, and (if ever revisited) a real writer-schema-per-message path on Spark instead of the
+reader-schema-only approach OSS Spark's `from_avro` currently forces.
 
 ## Follow-up prompt for a fresh agent (any model/vendor)
-> Continue the fraud-pipeline project autonomously. Read `docs/STATE.md` first (source of truth), then `docs/HANDOFF.md`. The single remaining roadmap item is v1.6 = `docs/tickets/18-schema-registry.md` (Avro + Redpanda schema registry): do NOT start it unless you have the budget to finish and E2E-verify BOTH demo modes (`make demo`, `make demo-cdc`) — a half-migrated wire format is worse than the current validated JSON. Write `docs/adr/0006-*.md` first (design constraints are pre-framed in the ticket). Work in self-contained chunks; if your environment supports cheaper delegate agents, use one per chunk (point them at ticket/files, don't paste content), review their diffs yourself line-by-line (this session caught 3 real subagent bugs in review), and run every gate live yourself: `make check`, `make smoke`, plus each ticket's acceptance. Auto-apply edits/commits/pushes when gates pass; atomic commits, no AI co-author trailers; update `docs/STATE.md` as you go; tag `v1.6` only after both demo modes are verified live. Hard stops requiring user confirmation: infra provisioning/teardown (`terraform apply`/`destroy`), `git push --force`, deleting data/branches/tags, anything touching secrets/credentials/IAM. Known environment facts: macOS + Colima (no GNU `timeout`, bash 3.2), compose needs `--env-file docker/demo.env` everywhere, pipeline image ENTRYPOINT is `python -m` (use `--entrypoint` for one-off commands), `.venv` must never be a symlink. At ~95% session usage: stop new work, run `make check` + `make smoke`, get the repo clean/pushed with correct tags, kill all containers (`make demo-down`, verify `docker ps` empty), rewrite `docs/HANDOFF.md` in this same format (session summary, what failed, roadmap, candid credibility assessment), and end by printing this same style of self-contained follow-up prompt.
+
+> Continue the fraud-pipeline project. Read `docs/STATE.md` first (source of truth), then this
+> file. v1.6 (typed events — Avro + Redpanda schema registry, ADR 0006) shipped and was fully
+> live-verified in both demo modes (`make demo`, `make demo-cdc`) on 2026-07-20, tag `v1.6`. All
+> seven items in the original hardening roadmap are now shipped. **No backlog item is currently
+> approved** — before starting any new work, confirm direction with the user. If they name a new
+> initiative, write a ticket under `docs/tickets/` and an ADR under `docs/adr/` before any code,
+> matching this project's established discipline (see prior ADRs 0001–0006 for the expected
+> depth). Known environment facts: macOS + Colima (no GNU `timeout`, bash 3.2), compose needs
+> `--env-file docker/demo.env` everywhere, pipeline image ENTRYPOINT is `python -m` (use
+> `--entrypoint` for one-off commands), `.venv` must never be a symlink, `docker compose` merges
+> a service's `ports:` list across `-f` files by *appending* — use the `!override` YAML tag to
+> replace it if you ever need a local port remap. Hard stops requiring user confirmation: infra
+> provisioning/teardown (`terraform apply`/`destroy`), `git push --force`, deleting data/branches/
+> tags, anything touching secrets/credentials/IAM, and killing any container/process this session
+> didn't start itself (check `docker ps -a` and `com.docker.compose.project.config_files` labels
+> before assuming an unfamiliar container is yours to touch). At ~95% session usage: stop new
+> work, run `make check` + `make smoke`, get the repo clean/pushed with correct tags, kill all
+> containers (`make demo-down`, verify `docker ps` empty), rewrite this file in the same format
+> (session summary, what failed, roadmap, candid credibility assessment), and end by printing this
+> same style of self-contained follow-up prompt.
