@@ -97,6 +97,20 @@ Two scenarios against the Dockerized Flask `/score` endpoint. **Warm** is the re
 
 Both are single-container Flask+gunicorn on a laptop (Colima VM) — comfortably inside a ~50ms authorization budget with headroom for network hops.
 
+### Load & backpressure (local, `make loadtest`, measured 2026-07-19 with the full demo stack live)
+
+Closed-loop load ladder against `/score` (thread-pool client, `scripts/benchmark.py`), with the scorer loop concurrently consuming — i.e. measured under realistic contention, not against an idle API:
+
+| Concurrency | n | Throughput | p50 | p95 | p99 | errors |
+|---|---|---|---|---|---|---|
+| 4 | 2,000 | 409 req/s | 9.3 ms | 14.2 ms | 18.7 ms | 0 |
+| 16 | 8,000 | 443 req/s | 34.8 ms | 54.0 ms | 61.7 ms | 0 |
+| 64 | 32,000 | 439 req/s | 148.1 ms | 210.6 ms | 249.0 ms | 0 |
+
+The single API container saturates at **~440 req/s**; past that, added concurrency only buys queueing delay (latency scales linearly, errors stay 0 — the box degrades predictably, it doesn't fall over).
+
+Backpressure: replaying the 77k-event sample at ~860 ev/s effective (producer set to 1,000/s) outruns the scorer's ~300–350 ev/s sustained consume; `kafka_consumergroup_lag{group="scorer"}` peaked at **~80k** when the producer finished (~90s in) and **drained to zero in ~3.5 minutes**, visibly on the Grafana board (`make demo OBS=1`). The drain accelerates toward the tail (~900 ev/s) because re-delivered event_ids hit the PK-dedupe fast path in the bank DB — an honest artifact of replaying the same events; first-delivery drain rate is the ~370 ev/s average.
+
 Deployed to Azure Container Apps (eastus2, 0.5 vCPU / 1Gi), the same benchmark measured cross-internet from a laptop: p50 147 ms / p95 282 ms / p99 290 ms at 21.8 req/s, 0 errors — the server-side scoring path (reported per-response as `latency_ms`) stayed at ~2–3 ms, so the gap is network RTT + TLS to the region, not the pipeline. The deployment was verified live and then torn down (`destroy.sh`) to stop the ~$40/mo Event Hubs Standard + Container Apps spend; `deploy.sh` recreates it in ~15 minutes.
 
 ## How to Run Locally

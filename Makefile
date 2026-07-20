@@ -1,4 +1,4 @@
-.PHONY: check lint test dbt-build tf-validate compose-validate fmt demo demo-cdc demo-down demo-down-volumes smoke
+.PHONY: check lint test dbt-build tf-validate compose-validate fmt demo demo-cdc demo-down demo-down-volumes smoke loadtest
 
 VENV := .venv/bin
 COMPOSE_FILE := docker/docker-compose.yml
@@ -62,3 +62,12 @@ demo-down-volumes:
 # scripts/smoke.sh. This is the merge gate for ticket 15 — run it live.
 smoke:
 	SMOKE_OBS=$(OBS) bash scripts/smoke.sh
+
+# Ticket 16: closed-loop load ladder against a LIVE demo stack's /score
+# (bring one up first: `make demo` / `make demo OBS=1`). Results land in
+# README "Load & backpressure". Fails fast if the API isn't reachable.
+loadtest:
+	@curl -sf -o /dev/null http://localhost:8000/healthz || { echo "!! api not reachable on :8000 — run 'make demo' first"; exit 1; }
+	@for c in 4 16 64; do \
+		$(VENV)/python scripts/benchmark.py --n $$((c*500)) --concurrency $$c --url http://localhost:8000/score; \
+	done
