@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "slug": "financial-payments-fraud-pipeline",
+  "title": "Financial Payments Fraud Pipeline",
+  "summary": "Event-driven fraud-detection pipeline with contract validation, streaming features, online scoring, and operational dashboards.",
+  "outcome": "Release-pending portfolio project; a public demo waits for a verified, cost-controlled deployment.",
+  "industries": ["Financial services"],
+  "categories": ["Data Engineering", "AI/ML", "Cloud"],
+  "stack": ["Python", "Redpanda", "Spark Structured Streaming", "XGBoost", "Redis", "Flask", "Docker", "Azure"],
+  "githubUrl": "https://github.com/vaibhavkhuranaaa/financial-payments-fraud-pipeline",
+  "liveUrl": null,
+  "deployment": {"provider": "Azure", "status": "release-pending", "runtime": "Docker Compose and Azure Container Apps"},
+  "metrics": ["Held-out PR-AUC 0.0227", "Held-out ROC-AUC 0.768", "Warm local p95 scoring latency 7.67 ms"],
+  "stages": ["Contract validation", "Event ingestion", "Streaming features", "Model training", "Online scoring", "Operations dashboard"],
+  "architecture": ["TabFormer synthetic data", "Redpanda", "Spark", "Redis and Delta", "XGBoost API", "Fraud operations dashboard"],
+  "evaluation": ["Chronological holdout evaluation, top-k precision, latency tests, load tests, and smoke tests are documented"],
+  "operationalTradeoffs": ["Streaming fidelity and observability increase local complexity and managed-cloud operating cost"],
+  "disclaimer": "Uses synthetic payment data only. It does not score real cardholders or provide financial-risk decisions."
+}
