@@ -1,0 +1,96 @@
+{
+  "type": "record",
+  "name": "Transaction",
+  "namespace": "com.fraudpipeline.contracts",
+  "doc": "Data contract v1 for card transaction events on the `transactions` topic. Producers MUST validate before publish; the stream job re-validates and routes violations to `transactions.dlq`. card_token is a salted SHA-256 token \u2014 raw PANs/card identifiers never cross the wire.",
+  "fields": [
+    {
+      "name": "schema_version",
+      "type": "string"
+    },
+    {
+      "name": "event_id",
+      "type": "string"
+    },
+    {
+      "name": "event_time",
+      "type": "string",
+      "doc": "Transaction timestamp, UTC ISO-8601"
+    },
+    {
+      "name": "card_token",
+      "type": "string",
+      "doc": "SHA-256(salt || user_id:card_id)"
+    },
+    {
+      "name": "user_id",
+      "type": "string"
+    },
+    {
+      "name": "amount",
+      "type": "double",
+      "doc": "Transaction amount in `currency` units; negatives are reversals/credits"
+    },
+    {
+      "name": "currency",
+      "type": "string",
+      "doc": "ISO-4217; TabFormer source is USD"
+    },
+    {
+      "name": "channel",
+      "type": "string",
+      "doc": "Card-present (chip/swipe) vs card-not-present (online)"
+    },
+    {
+      "name": "merchant_name",
+      "type": "string",
+      "doc": "Opaque merchant identifier from source data"
+    },
+    {
+      "name": "merchant_city",
+      "type": "string"
+    },
+    {
+      "name": "merchant_state",
+      "type": "string",
+      "doc": "US state code, or foreign country name for cross-border txns; 'ONLINE' for online txns"
+    },
+    {
+      "name": "merchant_country",
+      "type": "string",
+      "doc": "Derived ISO-3166 alpha-2; 'US' domestic, 'XX' unknown"
+    },
+    {
+      "name": "zip",
+      "type": [
+        "null",
+        "string"
+      ],
+      "doc": "Merchant ZIP; null for online/foreign",
+      "default": null
+    },
+    {
+      "name": "mcc",
+      "type": "int",
+      "doc": "Merchant category code"
+    },
+    {
+      "name": "errors",
+      "type": [
+        "null",
+        "string"
+      ],
+      "doc": "Authorization error codes from source (e.g. 'Insufficient Balance'), comma-separated",
+      "default": null
+    },
+    {
+      "name": "is_fraud",
+      "type": [
+        "null",
+        "boolean"
+      ],
+      "doc": "Ground-truth label; present only in replay/training flows, never emitted by production authorization systems",
+      "default": null
+    }
+  ]
+}

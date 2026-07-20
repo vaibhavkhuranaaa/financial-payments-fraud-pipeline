@@ -5,6 +5,9 @@ xgboost==2.1.1
 pyspark==3.5.1
 delta-spark==3.2.0
 confluent-kafka==2.5.0
+# ADR 0006: confluent_kafka.schema_registry (AvroSerializer/AvroDeserializer)
+# needs fastavro at import time; requests was already pinned above.
+fastavro==1.12.2
 redis==5.0.8
 jsonschema==4.23.0
 pandas==2.2.2

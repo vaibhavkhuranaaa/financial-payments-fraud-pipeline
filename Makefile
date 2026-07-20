@@ -1,4 +1,4 @@
-.PHONY: check lint test dbt-build tf-validate compose-validate fmt demo demo-cdc demo-down demo-down-volumes smoke loadtest
+.PHONY: check lint test dbt-build tf-validate compose-validate avro-schema-check fmt demo demo-cdc demo-down demo-down-volumes smoke loadtest
 
 VENV := .venv/bin
 COMPOSE_FILE := docker/docker-compose.yml
@@ -7,7 +7,7 @@ COMPOSE_FILE := docker/docker-compose.yml
 # containers' own env.
 COMPOSE_ENV_FILE := docker/demo.env
 
-check: lint test dbt-build tf-validate compose-validate
+check: lint test dbt-build tf-validate compose-validate avro-schema-check
 	@echo "✅ all checks passed — safe to push"
 
 lint:
@@ -27,6 +27,11 @@ tf-validate:
 
 compose-validate:
 	@if [ -f docker/docker-compose.yml ] && grep -q "services:" docker/docker-compose.yml; then docker compose -f docker/docker-compose.yml --env-file $(COMPOSE_ENV_FILE) config -q ; else echo "compose not present yet — skipping"; fi
+
+# Ticket 18 (ADR 0006): contracts/transaction.avsc is generated from
+# contracts/transaction.schema.json — this fails if they've drifted.
+avro-schema-check:
+	$(VENV)/python scripts/gen_avro_schema.py --check
 
 # Observability overlay toggle (ticket 13): `make demo OBS=1` /
 # `make demo-cdc OBS=1` adds Prometheus + Grafana + the lag exporter to

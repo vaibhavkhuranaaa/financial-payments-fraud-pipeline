@@ -31,6 +31,11 @@ jobs:
       - name: Run checks (lint, tests, dbt, terraform, compose config)
         run: bash scripts/check.sh
 
+      # Ticket 18 (ADR 0006): contracts/transaction.avsc must stay in sync
+      # with contracts/transaction.schema.json — see Makefile avro-schema-check.
+      - name: Avro schema sync check
+        run: python scripts/gen_avro_schema.py --check
+
       - name: Build api image
         run: docker build -f docker/Dockerfile.api -t fraud-api:ci .
 
