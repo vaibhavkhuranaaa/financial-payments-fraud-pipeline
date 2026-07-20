@@ -2,16 +2,65 @@
 
 No Kafka broker required — these exercise `to_event`/`validate_event`/
 `kafka_config` directly, plus the CLI's --dry-run path against the real
-sample CSV.
+sample CSV. The non-dry-run `replay()` path (Avro produce + DLQ, ADR 0006) is
+exercised hermetically by monkeypatching `confluent_kafka.Producer` and
+`schema_registry.registry_client` with fakes — no broker, no live registry.
 """
 
 from __future__ import annotations
 
 import copy
+import io
+import json
+import struct
 
+import fastavro
+
+from src.pipeline import schema_registry as sr
 from src.pipeline.ingestion import kafka_config, to_event, validate_event
 
 SALT = "test-salt"
+
+
+class _FakeProducer:
+    """Stands in for confluent_kafka.Producer: records produce() calls,
+    flush() is a no-op (nothing async to wait for)."""
+
+    def __init__(self, *_args, **_kwargs):
+        self.messages: list[dict] = []
+
+    def produce(self, topic, key=None, value=None):
+        self.messages.append({"topic": topic, "key": key, "value": value})
+
+    def flush(self, *_args, **_kwargs):
+        return 0
+
+
+class _FakeRegistryClient:
+    """Same shape as tests/test_schema_registry.py's fake — no network."""
+
+    def __init__(self, schema_id: int = 1):
+        self.schema_id = schema_id
+
+    def get_subjects(self):
+        return ["transactions-value"]
+
+    def register_schema(self, subject_name, schema, normalize_schemas=False) -> int:
+        return self.schema_id
+
+    def get_compatibility(self, subject_name=None) -> str:
+        return "BACKWARD"
+
+    def set_compatibility(self, subject_name=None, level=None) -> str:
+        return level
+
+
+def _decode_avro_value(raw: bytes) -> dict:
+    magic, schema_id = struct.unpack(">bI", raw[:5])
+    assert magic == 0
+    with open(sr._AVRO_SCHEMA_PATH, encoding="utf-8") as f:
+        avro_schema = fastavro.parse_schema(json.load(f))
+    return fastavro.schemaless_reader(io.BytesIO(raw[5:]), avro_schema)
 
 
 def _row(**overrides: object) -> dict[str, object]:
@@ -156,3 +205,108 @@ def test_dry_run_replay_against_sample_csv() -> None:
     )
     assert valid + invalid == 200
     assert valid > 0
+
+
+# --- Avro produce path (ADR 0006) -------------------------------------------
+
+
+def test_replay_produces_confluent_framed_avro_value(monkeypatch) -> None:
+    import confluent_kafka
+
+    import src.pipeline.ingestion as ingestion_module
+
+    fake_producer = _FakeProducer()
+    monkeypatch.setattr(confluent_kafka, "Producer", lambda *_a, **_kw: fake_producer)
+    monkeypatch.setattr(sr, "registry_client", lambda: _FakeRegistryClient())
+
+    valid, invalid = ingestion_module.replay(
+        input_path="data/sample/transactions_sample.csv",
+        salt=SALT,
+        eps=0,
+        max_events=5,
+        dry_run=False,
+    )
+
+    assert valid + invalid == 5
+    txn_messages = [m for m in fake_producer.messages if m["topic"] == "transactions"]
+    assert len(txn_messages) == valid
+    assert valid > 0
+    for msg in txn_messages:
+        assert isinstance(msg["value"], bytes)
+        assert msg["value"][0] == 0x00
+        assert msg["key"] is not None  # keyed by card_token
+        decoded = _decode_avro_value(msg["value"])
+        assert decoded["card_token"] == msg["key"]
+
+
+def test_replay_dlq_payloads_remain_json(monkeypatch, tmp_path) -> None:
+    import csv
+
+    import confluent_kafka
+
+    import src.pipeline.ingestion as ingestion_module
+
+    # The checked-in sample CSV has zero invalid rows; write a tiny CSV with
+    # one row whose Time is unparseable, to force the mapping-error -> DLQ path.
+    bad_row = _row(Time="not-a-time")
+    csv_path = tmp_path / "one_bad_row.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(bad_row.keys()))
+        writer.writeheader()
+        writer.writerow(bad_row)
+
+    fake_producer = _FakeProducer()
+    monkeypatch.setattr(confluent_kafka, "Producer", lambda *_a, **_kw: fake_producer)
+    monkeypatch.setattr(sr, "registry_client", lambda: _FakeRegistryClient())
+
+    valid, invalid = ingestion_module.replay(
+        input_path=str(csv_path), salt=SALT, eps=0, max_events=None, dry_run=False
+    )
+
+    assert valid == 0
+    assert invalid == 1
+    dlq_messages = [m for m in fake_producer.messages if m["topic"] == ingestion_module.KAFKA_TOPIC_DLQ]
+    assert len(dlq_messages) == 1
+    payload = json.loads(dlq_messages[0]["value"])
+    assert "error" in payload and "raw_row" in payload
+    assert "mapping error" in payload["error"]
+
+
+def test_replay_avro_serialization_failure_routes_to_dlq_and_counts(monkeypatch, caplog) -> None:
+    import confluent_kafka
+
+    import src.pipeline.ingestion as ingestion_module
+
+    fake_producer = _FakeProducer()
+
+    def _raising_serializer(*_a, **_kw):
+        raise ValueError("boom: schema mismatch")
+
+    monkeypatch.setattr(confluent_kafka, "Producer", lambda *_a, **_kw: fake_producer)
+    monkeypatch.setattr(sr, "registry_client", lambda: _FakeRegistryClient())
+    monkeypatch.setattr(sr, "build_avro_serializer", lambda _client: _raising_serializer)
+
+    with caplog.at_level("INFO", logger="src.pipeline.ingestion"):
+        valid, invalid = ingestion_module.replay(
+            input_path="data/sample/transactions_sample.csv",
+            salt=SALT,
+            eps=0,
+            max_events=5,
+            dry_run=False,
+        )
+
+    # Every valid row's avro-serialization fails, so nothing lands on
+    # `transactions` — everything valid instead lands on the DLQ.
+    txn_messages = [m for m in fake_producer.messages if m["topic"] == "transactions"]
+    assert txn_messages == []
+    assert valid > 0
+
+    avro_failure_dlq = [
+        json.loads(m["value"])
+        for m in fake_producer.messages
+        if m["topic"] == ingestion_module.KAFKA_TOPIC_DLQ
+        and "avro serialization failed" in json.loads(m["value"])["error"]
+    ]
+    assert len(avro_failure_dlq) == valid
+
+    assert f"avro_serialization_failures={valid}" in caplog.text

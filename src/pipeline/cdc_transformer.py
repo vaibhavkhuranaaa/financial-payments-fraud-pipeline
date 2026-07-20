@@ -188,15 +188,25 @@ def run(max_events: int | None) -> int:
     poll (no message within the poll timeout), so a message's offset is
     never committed before it has actually been produced downstream."""
     from confluent_kafka import Consumer, Producer
+    from confluent_kafka.serialization import MessageField, SerializationContext
+
+    from src.pipeline import schema_registry as sr
 
     consumer = Consumer(kafka_consumer_config())
     consumer.subscribe([KAFKA_TOPIC_CDC])
     producer = Producer(kafka_config())
 
+    # ADR 0006 decision 2: registry-framed Avro on the `transactions` wire.
+    registry = sr.registry_client()
+    sr.wait_for_registry(registry)
+    sr.ensure_backward_compatibility(registry)
+    avro_serializer = sr.build_avro_serializer(registry)
+
     consumed = 0
     produced = 0
     invalid = 0
     skipped = 0
+    avro_errors = 0
     since_flush = 0
 
     def _flush_and_commit() -> None:
@@ -241,12 +251,26 @@ def run(max_events: int | None) -> int:
             else:
                 validation_error = validate_event(event)
                 if validation_error is None:
-                    producer.produce(
-                        KAFKA_TOPIC_TRANSACTIONS,
-                        key=event["card_token"],
-                        value=json.dumps(event),
-                    )
-                    produced += 1
+                    try:
+                        avro_value = avro_serializer(
+                            event, SerializationContext(KAFKA_TOPIC_TRANSACTIONS, MessageField.VALUE)
+                        )
+                    except Exception as exc:
+                        # ADR 0006 decision 5: a validated event that still
+                        # fails Avro serialization goes to the DLQ (JSON)
+                        # with the reason, counted separately from `invalid`.
+                        producer.produce(
+                            KAFKA_TOPIC_DLQ,
+                            value=json.dumps({"raw": value, "error": f"avro serialization failed: {exc}"}),
+                        )
+                        avro_errors += 1
+                    else:
+                        producer.produce(
+                            KAFKA_TOPIC_TRANSACTIONS,
+                            key=event["card_token"],
+                            value=avro_value,
+                        )
+                        produced += 1
                 else:
                     producer.produce(
                         KAFKA_TOPIC_DLQ, value=json.dumps({"raw": value, "error": validation_error})
@@ -260,11 +284,12 @@ def run(max_events: int | None) -> int:
         consumer.close()
 
     logger.info(
-        "cdc-transformer: consumed=%d produced=%d invalid=%d skipped=%d",
+        "cdc-transformer: consumed=%d produced=%d invalid=%d skipped=%d avro_errors=%d",
         consumed,
         produced,
         invalid,
         skipped,
+        avro_errors,
     )
     return produced
 

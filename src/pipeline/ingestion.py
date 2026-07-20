@@ -292,14 +292,23 @@ def replay(
 ) -> tuple[int, int]:
     """Replay `input_path` to Kafka (or count-only in dry-run). Returns (valid, invalid)."""
     producer = None
+    avro_serializer = None
     if not dry_run:
         from confluent_kafka import Producer
+        from confluent_kafka.serialization import MessageField, SerializationContext
+
+        from src.pipeline import schema_registry as sr
 
         producer = Producer(kafka_config())
+        registry = sr.registry_client()
+        sr.wait_for_registry(registry)
+        sr.ensure_backward_compatibility(registry)
+        avro_serializer = sr.build_avro_serializer(registry)
 
     limiter = _RateLimiter(eps)
     valid_count = 0
     invalid_count = 0
+    avro_error_count = 0
 
     for i, row in enumerate(_iter_csv_rows(input_path)):
         if max_events is not None and i >= max_events:
@@ -315,11 +324,24 @@ def replay(
         if reason is None:
             valid_count += 1
             if producer is not None:
-                producer.produce(
-                    KAFKA_TOPIC_TRANSACTIONS,
-                    key=event["card_token"],
-                    value=json.dumps(event),
-                )
+                # ADR 0006 decision 2: registry-framed Avro on the wire.
+                try:
+                    value = avro_serializer(
+                        event, SerializationContext(KAFKA_TOPIC_TRANSACTIONS, MessageField.VALUE)
+                    )
+                except Exception as exc:
+                    # ADR 0006 decision 5: a validated event that still fails
+                    # Avro serialization goes to the DLQ (JSON) with the
+                    # reason, counted separately from validation failures.
+                    avro_error_count += 1
+                    dlq_payload = {"raw_row": row, "error": f"avro serialization failed: {exc}"}
+                    producer.produce(KAFKA_TOPIC_DLQ, value=json.dumps(dlq_payload))
+                else:
+                    producer.produce(
+                        KAFKA_TOPIC_TRANSACTIONS,
+                        key=event["card_token"],
+                        value=value,
+                    )
         else:
             invalid_count += 1
             if producer is not None:
@@ -328,6 +350,12 @@ def replay(
 
     if producer is not None:
         producer.flush(10.0)
+        logger.info(
+            "replay complete: valid=%d invalid=%d avro_serialization_failures=%d",
+            valid_count,
+            invalid_count,
+            avro_error_count,
+        )
 
     return valid_count, invalid_count
 
