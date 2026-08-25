@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import math
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,26 @@ from src.dashboard.data import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ARTIFACT_ROOT = REPO_ROOT / "artifacts"
+
+
+class _TokenBucket:
+    def __init__(self, rate: float, capacity: int) -> None:
+        self.rate = rate
+        self.capacity = float(capacity)
+        self.tokens = float(capacity)
+        self.updated_at = time.monotonic()
+        self.lock = threading.Lock()
+
+    def allow(self) -> bool:
+        with self.lock:
+            now = time.monotonic()
+            elapsed = now - self.updated_at
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+            self.updated_at = now
+            if self.tokens < 1:
+                return False
+            self.tokens -= 1
+            return True
 
 
 def _empty_figure(message: str) -> go.Figure:
@@ -187,6 +209,32 @@ def _strategy_context(
     return strategy, targets.get(0.80)
 
 
+def _brief_copy(summary: dict[str, Any] | None) -> tuple[str, str]:
+    if not summary:
+        return (
+            "Strategy evidence is unavailable.",
+            "Build a complete model run to compare workload and fraud capture.",
+        )
+    captured = int(summary["true_positive"])
+    missed = int(summary["false_negative"])
+    total_fraud = captured + missed
+    binding = str(summary["binding_control"]).capitalize()
+    precision = summary["precision"]
+    precision_copy = (
+        f" at {format_ratio(precision)} precision"
+        if precision is not None
+        else "; precision is unavailable because the queue is empty"
+    )
+    return (
+        f"{binding}: {captured} of {total_fraud} observed frauds captured.",
+        f"The active {summary['reviews_per_1000']:.2f}-per-1,000 queue reviews "
+        f"{format_count(summary['review_count'])} rows and delivers "
+        f"{format_ratio(summary['recall'])} recall{precision_copy}. "
+        f"{format_count(summary['false_positive'])} reviews are non-fraud; "
+        f"{format_count(missed)} observed frauds remain outside the queue.",
+    )
+
+
 def _target_records(store: ArtifactStore) -> list[dict[str, Any]]:
     if not store.ready:
         return []
@@ -206,26 +254,10 @@ def _target_records(store: ArtifactStore) -> list[dict[str, Any]]:
 def _layout(store: ArtifactStore) -> html.Div:
     disabled = not store.ready
     error = store.error or ""
-    strategy, target_80 = _strategy_context(store)
+    strategy, _ = _strategy_context(store)
     current = strategy["current_policy"] if strategy else None
     model = strategy["model"] if strategy else None
-    captured = int(current["true_positive"]) if current else 0
-    total_fraud = captured + int(current["false_negative"]) if current else 0
-    binding = str(current["binding_control"]).capitalize() if current else "Unavailable"
-    brief_title = (
-        f"{binding}: {captured} of {total_fraud} observed frauds captured."
-        if current
-        else "Strategy evidence is unavailable."
-    )
-    brief_detail = (
-        f"The current {current['reviews_per_1000']:.1f}-per-1,000 queue delivers "
-        f"{format_ratio(current['recall'])} recall at {format_ratio(current['precision'])} precision. "
-        f"A retrospective 80% recall scenario needs "
-        f"{int(target_80['review_count']):,} reviews ({target_80['reviews_per_1000']:.2f} per 1,000), a score floor "
-        f"at or below {target_80['threshold']:.2%}, and lowers queue precision to {target_80['precision']:.1%}."
-        if current and target_80
-        else "Build a complete model run to compare workload and fraud capture."
-    )
+    brief_title, brief_detail = _brief_copy(current)
     target_rows = _target_records(store)
     return html.Div(
         [
@@ -270,8 +302,8 @@ def _layout(store: ArtifactStore) -> html.Div:
                             html.Div(
                                 [
                                     html.Div("Director brief", className="brief-label"),
-                                    html.H2(brief_title),
-                                    html.P(brief_detail),
+                                    html.H2(brief_title, id="brief-title"),
+                                    html.P(brief_detail, id="brief-detail"),
                                 ],
                                 className="brief-copy",
                             ),
@@ -901,7 +933,25 @@ def create_app(artifact_root: str | Path | None = None) -> Dash:
     app.layout = _layout(store)
     app.server.config["ARTIFACT_STORE"] = store
 
-    @app.server.get("/healthz")
+    rate = float(os.environ.get("PUBLIC_RATE_LIMIT_RPS", "0"))
+    burst = int(os.environ.get("PUBLIC_RATE_LIMIT_BURST", "40"))
+    limiter = _TokenBucket(rate, burst) if rate > 0 and burst > 0 else None
+
+    @app.server.before_request
+    def enforce_public_rate_limit() -> Any:
+        if limiter is None or limiter.allow():
+            return None
+        response = jsonify(
+            {
+                "error": "public request limit reached",
+                "retry_after_seconds": 1,
+            }
+        )
+        response.status_code = 429
+        response.headers["Retry-After"] = "1"
+        return response
+
+    @app.server.get("/health")
     def health() -> Any:
         status = 200 if store.ready else 503
         return jsonify(
@@ -917,10 +967,16 @@ def create_app(artifact_root: str | Path | None = None) -> Dash:
     @app.server.get("/api/summary")
     def summary_api() -> Any:
         try:
-            threshold = float(request.args.get("threshold", store.default_threshold))
-            capacity = float(
-                request.args.get("reviews_per_1000", store.default_capacity)
-            )
+            threshold_arg = request.args.get("threshold")
+            capacity_arg = request.args.get("reviews_per_1000")
+            if threshold_arg is None and capacity_arg is None:
+                if not store.ready:
+                    raise ArtifactLoadError(
+                        store.error or "model artifacts are unavailable"
+                    )
+                return jsonify(store.default_summary)
+            threshold = float(threshold_arg or store.default_threshold)
+            capacity = float(capacity_arg or store.default_capacity)
             return jsonify(store.decision_view(threshold, capacity).summary)
         except (ArtifactLoadError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400 if store.ready else 503
@@ -995,6 +1051,8 @@ def create_app(artifact_root: str | Path | None = None) -> Dash:
         return threshold, capacity
 
     @app.callback(
+        Output("brief-title", "children"),
+        Output("brief-detail", "children"),
         Output("threshold-readout", "children"),
         Output("capacity-readout", "children"),
         Output("binding-control", "children"),
@@ -1032,7 +1090,10 @@ def create_app(artifact_root: str | Path | None = None) -> Dash:
         capacity = store.default_capacity if capacity is None else float(capacity)
         if not store.ready:
             unavailable = "Unavailable"
+            brief_title, brief_detail = _brief_copy(None)
             return (
+                brief_title,
+                brief_detail,
                 f"{threshold:.1%}",
                 f"{capacity:g}",
                 unavailable,
@@ -1084,7 +1145,10 @@ def create_app(artifact_root: str | Path | None = None) -> Dash:
         )
         captured_amount = summary["captured_amount"]
         missed_amount = summary["missed_amount"]
+        brief_title, brief_detail = _brief_copy(summary)
         return (
+            brief_title,
+            brief_detail,
             f"{threshold:.1%}",
             f"{capacity:g} / 1,000",
             str(summary["binding_control"]).capitalize(),

@@ -1,13 +1,13 @@
 # Financial Payments Fraud Decision Workbench
 
 ![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-18%20passing-19734b)
+![Tests](https://img.shields.io/badge/tests-21%20passing-19734b)
 ![PR--AUC](https://img.shields.io/badge/test%20PR--AUC-0.7744-255f73)
 ![Review policy](https://img.shields.io/badge/recall%20at%201%20per%201000-68.0%25-c26b27)
 
-A local, evidence-backed fraud review product built on the full MLG-ULB `creditcard.csv` benchmark. It connects model selection to a bounded analyst queue and keeps the raw source and row-level artifacts out of Git.
+An evidence-backed fraud review product built on the full MLG-ULB `creditcard.csv` benchmark. It connects model selection to a bounded analyst queue and keeps the raw source and row-level artifacts out of Git.
 
-The product uses the full 284,807-row benchmark and its real trained run artifacts. It does not generate a substitute product dataset. It is complete and verified for local use, with no hosted-deployment or production-performance claim.
+The product uses the full 284,807-row benchmark and its real trained run artifacts. It does not generate a substitute product dataset. The [public decision workbench](https://fraud-decision-workbench-lfpwcuk37a-uc.a.run.app) serves the complete scored holdout from a cost-bounded Cloud Run service.
 
 ## What it does
 
@@ -64,11 +64,11 @@ make demo
 
 Open `http://127.0.0.1:8050`. The same runtime can be built with `make docker-build`; mount the ignored `artifacts/` directory read-only.
 
-CI runs lint, 18 hermetic tests, replay-contract checks, formatting, container configuration, and an image build without requiring the private dataset.
+CI runs lint, 21 hermetic tests, replay-contract checks, formatting, container configuration, and an image build without requiring the private dataset.
 
 ## Data
 
-The workbench uses the [MLG-ULB credit card fraud benchmark](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud). Download access and reuse terms remain between the user and source provider. The repository does not redistribute the CSV, row-level scores, or trained model artifacts.
+The workbench uses the [MLG-ULB credit card fraud benchmark](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud). Download access and reuse terms remain between the user and source provider. The repository does not redistribute the CSV or trained artifact files. The public service returns anonymized scored holdout rows for its review queue and drill-down workflow.
 
 ## Limits
 
@@ -77,9 +77,11 @@ The workbench uses the [MLG-ULB credit card fraud benchmark](https://www.kaggle.
 - `Class` is used only for training and retrospective evaluation, never as a scoring feature.
 - Model signals are associations, not causal explanations.
 - Only 57 fraud rows occur in calibration and 75 in test, so uncertainty is material.
-- No production, deployment, throughput, latency, loss-avoided, or fairness claim is supported.
-- The raw dataset and row-level artifacts are not redistributed.
+- No production-readiness, availability, throughput, latency, loss-avoided, or fairness claim is supported.
+- The raw dataset and trained artifact files are not redistributed.
 
-## Scaling
+## Scaling and hosting
 
-A later scaled topology could place immutable artifacts in object storage, schedule training in a managed job, and serve the same read-only workbench behind authenticated HTTPS. That topology has not been provisioned or measured.
+The public demonstration runs one scale-to-zero Cloud Run instance at most. It mounts the immutable active run read-only from private object storage and applies a process-wide sustained request ceiling with a bounded burst allowance. The raw CSV is never uploaded. The public queue contains only anonymized benchmark rows and model outputs; it has no cardholder, merchant, or account identity.
+
+The hosting configuration is a cost-bounded portfolio demonstration, not a production availability, security, latency, throughput, or scaling claim.

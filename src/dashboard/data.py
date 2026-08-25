@@ -38,6 +38,7 @@ class ArtifactStore:
         self.scored = pd.DataFrame()
         self.frontier = pd.DataFrame()
         self.recall_targets = pd.DataFrame()
+        self.default_summary: dict[str, Any] = {}
         self.error: str | None = None
         self.refresh()
 
@@ -63,6 +64,13 @@ class ArtifactStore:
                 ),
             )
             self.recall_targets = minimum_workload_for_recall(self.scored)
+            threshold = float(self.bundle["threshold"])
+            capacity = float(self.bundle["reviews_per_1000"])
+            self.default_summary = policy_summary(
+                apply_review_policy(self.scored, threshold, capacity),
+                threshold,
+                capacity,
+            )
             self.error = None
         except Exception as exc:  # noqa: BLE001 - the UI must name artifact failures
             self.manifest = None
@@ -71,6 +79,7 @@ class ArtifactStore:
             self.scored = pd.DataFrame()
             self.frontier = pd.DataFrame()
             self.recall_targets = pd.DataFrame()
+            self.default_summary = {}
             self.error = str(exc)
 
     @property
@@ -122,13 +131,7 @@ class ArtifactStore:
             raise ArtifactLoadError(self.error or "model artifacts are unavailable")
         return {
             "run_id": self.manifest["run_id"],
-            "current_policy": policy_summary(
-                apply_review_policy(
-                    self.scored, self.default_threshold, self.default_capacity
-                ),
-                self.default_threshold,
-                self.default_capacity,
-            ),
+            "current_policy": self.default_summary,
             "frontier": self.frontier.to_dict("records"),
             "recall_targets": self.recall_targets.to_dict("records"),
             "model": {

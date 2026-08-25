@@ -16,7 +16,7 @@ def main() -> int:
     app = create_app(args.artifacts)
     client = app.server.test_client()
 
-    health = client.get("/healthz")
+    health = client.get("/health")
     assert health.status_code == 200, health.get_json()
     summary = client.get("/api/summary").get_json()
     assert summary["review_count"] <= summary["capacity_limit"]

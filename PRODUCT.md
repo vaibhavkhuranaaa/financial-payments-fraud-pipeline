@@ -33,7 +33,7 @@ The product runs locally from the full git-ignored dataset and real artifact dir
 
 ## Evidence on Hand
 
-The full source is present at `data/raw/creditcard.csv`. Local validation records the shape and quality aggregates. Versioned run artifacts under `artifacts/` contain the selected model, scored chronological holdout, evaluation, partition report, and manifest. No hosted deployment, customer, production, throughput, latency, or scaled-stack evidence exists.
+The full source is present at `data/raw/creditcard.csv`. Local validation records the shape and quality aggregates. Ignored run artifacts under `artifacts/` contain the selected model, scored chronological holdout, evaluation, partition report, and manifest. The public Cloud Run demonstration mounts the complete active run from private object storage and exposes only anonymized benchmark rows and model outputs. No customer, production-readiness, live-volume, or service-level evidence exists.
 
 ## Product Principles
 

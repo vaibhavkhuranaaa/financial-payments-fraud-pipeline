@@ -16,8 +16,8 @@ One data path keeps model evaluation, policy metrics, queue records, and drill-d
 
 ## Not done
 
-No hosted deployment or production-scale claim is retained. Raw source and run artifacts remain local inputs to the product.
+No generated, sampled, or substitute hosted dataset is retained. The raw source remains local and is never uploaded. No production-scale claim is made.
 
 ## Changed
 
-The deployment blueprint, generated demo artifacts, substitute scorer, dashboard disclosure, and hosted-demo claims were removed. The container again requires the real artifact mount.
+The generated demo artifacts and substitute scorer were removed. Local and hosted containers require the real complete artifact run. Decision 0009 bounds the public service that mounts that run.
