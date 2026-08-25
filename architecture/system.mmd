@@ -1,0 +1,11 @@
+flowchart LR
+    A[Private creditcard.csv] --> B[Schema validation]
+    B --> C[Chronological partitions]
+    C --> D[Logistic baseline]
+    C --> E[XGBoost challenger]
+    D --> F[Calibration selection gate]
+    E --> F
+    F --> G[Immutable local run]
+    G --> H[Dash and Flask workbench]
+    H --> I[Threshold and capacity policy]
+    I --> J[Bounded review queue]

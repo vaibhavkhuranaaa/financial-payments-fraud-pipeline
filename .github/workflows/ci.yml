@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements-dev.txt
+
+      - name: Run repository checks
+        run: make check
+
+      - name: Check formatting
+        run: .venv/bin/ruff format --check src/fraud_workbench src/dashboard src/pipeline/train.py tests
+
+      - name: Validate container configuration
+        run: docker compose -f docker/compose.yml config
+
+      - name: Build container
+        run: docker build -f docker/Dockerfile -t fraud-decision-workbench:ci .

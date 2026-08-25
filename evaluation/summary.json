@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "run_id": "d641b4fbec8c6a38",
+  "source": {
+    "rows": 284807,
+    "columns": 31,
+    "fraud_rows": 492,
+    "missing_values": 0,
+    "exact_duplicates_preserved": 1081
+  },
+  "partitions": {
+    "train": {"rows": 170888, "fraud_rows": 360},
+    "calibration": {"rows": 56957, "fraud_rows": 57},
+    "test": {"rows": 56962, "fraud_rows": 75}
+  },
+  "selection": {
+    "selected_model": "logistic_regression",
+    "calibration_pr_auc": {
+      "logistic_regression": 0.7720297094,
+      "xgboost": 0.7784507783,
+      "challenger_lift": 0.0064210689,
+      "minimum_required_lift": 0.02
+    }
+  },
+  "held_out_test": {
+    "logistic_regression": {
+      "pr_auc": 0.7743993703,
+      "pr_auc_ci_95": [0.6704315824, 0.8501202076],
+      "brier": 0.0004560429
+    },
+    "xgboost_diagnostic": {
+      "pr_auc": 0.7961646825,
+      "pr_auc_ci_95": [0.6949244821, 0.8694030446],
+      "brier": 0.0004182618
+    }
+  },
+  "policy_at_1_review_per_1000": {
+    "threshold": 0.2817814026,
+    "reviewed": 56,
+    "captured_fraud": 51,
+    "missed_fraud": 24,
+    "false_positives": 5,
+    "precision": 0.9107142857,
+    "recall": 0.68,
+    "amount_recall": 0.5728336218,
+    "captured_source_amount": 4427.58,
+    "missed_source_amount": 3301.68,
+    "reviews_per_capture": 1.0980392157,
+    "queue_lift_over_prevalence": 691.6814285714,
+    "binding_control": "capacity"
+  },
+  "retrospective_recall_scenarios": [
+    {"target_recall": 0.75, "minimum_reviews": 79, "reviews_per_1000": 1.3868895053, "precision": 0.7215189873, "false_positives": 22, "amount_recall": 0.6586646070},
+    {"target_recall": 0.80, "minimum_reviews": 120, "reviews_per_1000": 2.1066676030, "precision": 0.5, "false_positives": 60, "amount_recall": 0.6606738549},
+    {"target_recall": 0.85, "minimum_reviews": 217, "reviews_per_1000": 3.8095572487, "precision": 0.2949308756, "false_positives": 153, "amount_recall": 0.6937248844},
+    {"target_recall": 0.90, "minimum_reviews": 2430, "reviews_per_1000": 42.6600189600, "precision": 0.0279835391, "false_positives": 2362, "amount_recall": 0.7433971687},
+    {"target_recall": 0.95, "minimum_reviews": 7762, "reviews_per_1000": 136.2662827850, "precision": 0.0092759598, "false_positives": 7690, "amount_recall": 0.8312839780},
+    {"target_recall": 1.0, "minimum_reviews": 17541, "reviews_per_1000": 307.9421368632, "precision": 0.0042756969, "false_positives": 17466, "amount_recall": 1.0}
+  ],
+  "limitations": [
+    "Retrospective anonymized benchmark with no intervention outcomes.",
+    "Only 57 fraud rows in calibration and 75 in test, so uncertainty is material.",
+    "The challenger did not clear its predeclared calibration lift and was not selected.",
+    "No production, deployment, throughput, or latency claim is supported."
+  ]
+}
