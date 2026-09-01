@@ -1,7 +1,7 @@
 # Financial Payments Fraud Decision Workbench
 
 ![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-21%20passing-19734b)
+![Tests](https://img.shields.io/badge/tests-22%20passing-19734b)
 ![PR--AUC](https://img.shields.io/badge/test%20PR--AUC-0.7744-255f73)
 ![Review policy](https://img.shields.io/badge/recall%20at%201%20per%201000-68.0%25-c26b27)
 
@@ -64,7 +64,7 @@ make demo
 
 Open `http://127.0.0.1:8050`. The same runtime can be built with `make docker-build`; mount the ignored `artifacts/` directory read-only.
 
-CI runs lint, 21 hermetic tests, replay-contract checks, formatting, container configuration, and an image build without requiring the private dataset.
+CI runs lint, 22 hermetic tests, replay-contract checks, formatting, container configuration, and an image build without requiring the private dataset.
 
 ## Data
 

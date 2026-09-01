@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -932,6 +933,8 @@ def create_app(artifact_root: str | Path | None = None) -> Dash:
     app.index_string = app.index_string.replace("<html>", '<html lang="en">')
     app.layout = _layout(store)
     app.server.config["ARTIFACT_STORE"] = store
+    source_sha = os.environ.get("SOURCE_SHA", "")
+    release_ready = re.fullmatch(r"[0-9a-f]{40}", source_sha) is not None
 
     rate = float(os.environ.get("PUBLIC_RATE_LIMIT_RPS", "0"))
     burst = int(os.environ.get("PUBLIC_RATE_LIMIT_BURST", "40"))
@@ -956,6 +959,16 @@ def create_app(artifact_root: str | Path | None = None) -> Dash:
         status = 200 if store.ready else 503
         return jsonify(
             {"status": "ready" if store.ready else "error", "detail": store.error}
+        ), status
+
+    @app.server.get("/api/release")
+    def release() -> Any:
+        status = 200 if release_ready else 503
+        return jsonify(
+            {
+                "source_sha": source_sha if release_ready else None,
+                "status": "ready" if release_ready else "error",
+            }
         ), status
 
     @app.server.get("/api/metrics")

@@ -73,6 +73,19 @@ def test_public_request_limit_rejects_excess_requests(
     assert response.get_json()["error"] == "public request limit reached"
 
 
+def test_release_route_requires_commit_sha(artifact_root, monkeypatch) -> None:
+    monkeypatch.delenv("SOURCE_SHA", raising=False)
+    unavailable = create_app(artifact_root).server.test_client().get("/api/release")
+    assert unavailable.status_code == 503
+    assert unavailable.get_json()["source_sha"] is None
+
+    expected = "a" * 40
+    monkeypatch.setenv("SOURCE_SHA", expected)
+    available = create_app(artifact_root).server.test_client().get("/api/release")
+    assert available.status_code == 200
+    assert available.get_json() == {"source_sha": expected, "status": "ready"}
+
+
 def test_dashboard_shell_contains_policy_and_recovery_states(artifact_root) -> None:
     app = create_app(artifact_root)
     page = app.server.test_client().get("/").get_data(as_text=True)

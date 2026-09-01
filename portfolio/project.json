@@ -1,0 +1,457 @@
+{
+  "version": 2,
+  "slug": "financial-payments-fraud-pipeline",
+  "title": "Financial Payments Fraud Decision Workbench",
+  "summary": "A fraud strategy workbench built from the full 284,807-row MLG-ULB benchmark, with chronological evaluation, calibrated scoring, and a capacity-bounded review queue.",
+  "outcome": "A fraud operations lead can compare threshold and staffing choices, see captured and missed fraud, inspect anonymized cases, and identify where extra review capacity stops paying back.",
+  "industries": [
+    "Payments",
+    "Financial Crime"
+  ],
+  "categories": [
+    "AI/ML",
+    "Data Engineering",
+    "Cloud"
+  ],
+  "stack": [
+    "Python",
+    "pandas",
+    "scikit-learn",
+    "XGBoost",
+    "Dash",
+    "Flask",
+    "Plotly",
+    "Docker",
+    "Google Cloud Run",
+    "Cloud Storage"
+  ],
+  "githubUrl": "https://github.com/vaibhavkhuranaaa/financial-payments-fraud-pipeline",
+  "liveUrl": "https://fraud-decision-workbench-lfpwcuk37a-uc.a.run.app",
+  "deployment": {
+    "provider": "Google Cloud Run",
+    "status": "live",
+    "runtime": "Python 3.11 container with one scale-to-zero instance and a private read-only Cloud Storage artifact mount",
+    "exposure": "anonymous",
+    "productionClaim": false,
+    "verifiedAt": "2026-09-01T01:25:45Z",
+    "expiresAt": null,
+    "evidenceRefs": [
+      "deployment.live",
+      "deployment.cost-bound"
+    ]
+  },
+  "metrics": [
+    "68.0% retrospective fraud recall at one review per 1,000 holdout transactions",
+    "91.1% retrospective precision in a 56-transaction bounded review queue",
+    "0.7744 held-out PR-AUC with a 95% bootstrap interval from 0.6704 to 0.8501",
+    "120 reviews required for the post-hoc 80% recall scenario; 2,430 for 90%",
+    "57.3% observed fraud-amount recall at the default policy"
+  ],
+  "stages": [
+    "Validate all source rows and preserve stable lineage",
+    "Split train, calibration, and test periods by chronology",
+    "Compare baseline and challenger against a predeclared complexity gate",
+    "Calibrate the selected model and write one immutable artifact run",
+    "Convert threshold and review capacity into a deterministic ranked queue",
+    "Serve policy consequences, scenarios, and anonymized drill-downs"
+  ],
+  "architecture": [
+    "Private full benchmark validated into stable transaction lineage",
+    "Chronological train, calibration, and untouched test partitions",
+    "Class-weighted logistic baseline and XGBoost challenger",
+    "Calibration gate selecting the simpler model before test evaluation",
+    "Immutable model, evaluation, and 56,962-row scored holdout artifact run",
+    "Dash and Flask decision workbench on bounded Cloud Run"
+  ],
+  "evaluation": [
+    "Model selection used calibration PR-AUC and a 0.02 minimum challenger lift before any test result was read",
+    "Final ranking used one untouched chronological test partition with 75 fraud rows",
+    "PR-AUC uncertainty used 300 deterministic bootstrap resamples",
+    "Threshold came from calibration; test capacity was capped at one review per 1,000 rows",
+    "Recall scenarios rank the same holdout post hoc and are diagnostic, not deployment thresholds"
+  ],
+  "operationalTradeoffs": [
+    "The challenger scored higher on test but missed the predeclared calibration lift, so the logistic baseline shipped",
+    "The default queue captures 68.0% of observed fraud with five non-fraud reviews, while 90% recall needs 2,430 reviews and 2.8% precision",
+    "Scale-to-zero and one maximum instance minimize cost but do not provide a production availability objective",
+    "The anonymized benchmark supports ranking and capacity analysis but not customer, merchant, channel, fairness, or intervention decisions"
+  ],
+  "disclaimer": "The source benchmark is private and anonymized. The public service exposes scored holdout outputs without cardholder, account, merchant, or customer identity. Results are retrospective and do not establish production performance, causal explanation, loss avoided, fairness, or authorization to approve or decline a payment.",
+  "presentation": {
+    "question": "How much known fraud can a fixed review team capture, and where does extra capacity stop paying back?",
+    "answer": "At one review per 1,000 transactions, 56 reviews capture 51 of 75 observed frauds at 91.1% precision and 68.0% recall. Reaching 80% needs 120 reviews; reaching 90% needs 2,430, exposing the saturation zone.",
+    "decisionSupported": "Compare retrospective score thresholds and review staffing levels before proposing an operating policy.",
+    "architectureAlt": "Private benchmark data flows through chronological model selection and immutable artifacts into a bounded fraud strategy workbench.",
+    "evaluationMode": "Calibration-selected model and threshold, followed by one untouched chronological test evaluation and post-hoc capacity scenarios.",
+    "publicationStatus": "Live public portfolio demonstration; not a production payment system.",
+    "licenseNote": "Source access and reuse terms were accepted by the owner. The repository does not grant redistribution rights or publish the raw CSV.",
+    "terms": [
+      {
+        "term": "Review capacity",
+        "plainLanguage": "Maximum cases the team can inspect",
+        "projectUse": "Caps the ranked queue per 1,000 transactions"
+      },
+      {
+        "term": "Recall",
+        "plainLanguage": "Share of observed fraud captured",
+        "projectUse": "Makes fraud left outside the review queue visible"
+      },
+      {
+        "term": "Precision",
+        "plainLanguage": "Share of reviewed cases that are fraud",
+        "projectUse": "Shows how much analyst work is useful in hindsight"
+      },
+      {
+        "term": "PR-AUC",
+        "plainLanguage": "Ranking quality for a rare positive outcome",
+        "projectUse": "Compares models without hiding class imbalance"
+      }
+    ],
+    "technologyRoles": {
+      "Python": "Training, artifact validation, policy logic, and API runtime",
+      "scikit-learn": "Class-weighted baseline, calibration, and metrics",
+      "XGBoost": "Nonlinear challenger evaluated behind a complexity gate",
+      "Dash and Plotly": "Interactive policy controls, evidence, and queue inspection",
+      "Cloud Run": "Public scale-to-zero container with one maximum instance",
+      "Cloud Storage": "Private read-only mount for the complete active artifact run"
+    },
+    "quickStart": [
+      {
+        "label": "Verify repository",
+        "command": "make check"
+      },
+      {
+        "label": "Replay full-data run",
+        "command": "make train"
+      },
+      {
+        "label": "Run local workbench",
+        "command": "make demo"
+      }
+    ],
+    "securityControls": [
+      {
+        "control": "Private artifact boundary",
+        "implementation": "Raw source stays local; the hosted container mounts the active run read-only from private Cloud Storage.",
+        "evidenceRefs": [
+          "data.boundary",
+          "deployment.live"
+        ],
+        "limitation": "Public APIs intentionally expose anonymized scores, outcomes, amounts, elapsed time, and top model signals for the retrospective holdout."
+      },
+      {
+        "control": "Bounded public work",
+        "implementation": "Cloud Run permits one instance, scales to zero, and applies a process-wide token bucket at two requests per second with a 40-request burst.",
+        "evidenceRefs": [
+          "deployment.cost-bound"
+        ],
+        "limitation": "The in-process bucket resets when the container restarts and is not identity-aware abuse control."
+      },
+      {
+        "control": "Fail-closed artifact loading",
+        "implementation": "Missing, incomplete, or corrupt artifact runs return an error and HTTP 503 instead of zero metrics.",
+        "evidenceRefs": [
+          "delivery.tests"
+        ],
+        "limitation": "This validates artifact integrity, not upstream label correctness."
+      }
+    ],
+    "costBoundaries": [
+      {
+        "component": "Cloud Run",
+        "boundary": "Minimum zero and maximum one instance",
+        "implication": "No idle compute reservation and no horizontal cost expansion"
+      },
+      {
+        "component": "Public requests",
+        "boundary": "Two requests per second with a 40-request burst",
+        "implication": "Sustained anonymous request work is capped within the single process"
+      },
+      {
+        "component": "Artifacts",
+        "boundary": "One 19 MB active run mounted read-only",
+        "implication": "No raw dataset upload, database, or duplicate hosted artifact path"
+      }
+    ],
+    "repositoryStructure": [
+      {
+        "path": "src/fraud_workbench/",
+        "purpose": "Data validation, modeling, artifacts, and policy logic"
+      },
+      {
+        "path": "src/dashboard/",
+        "purpose": "Decision interface and HTTP APIs"
+      },
+      {
+        "path": "evaluation/",
+        "purpose": "Versioned aggregate results and limitations"
+      },
+      {
+        "path": "docs/decisions/",
+        "purpose": "Architecture and operating decisions with rejected alternatives"
+      }
+    ],
+    "verification": [
+      {
+        "check": "Tests, lint, and deterministic replay",
+        "command": "make check",
+        "evidenceRef": "delivery.tests"
+      },
+      {
+        "check": "Real-artifact API smoke",
+        "command": "make smoke",
+        "evidenceRef": "deployment.live"
+      },
+      {
+        "check": "Published aggregate evaluation",
+        "command": "python -m json.tool evaluation/summary.json",
+        "evidenceRef": "policy.default"
+      }
+    ]
+  },
+  "dataDisclosure": {
+    "source": "Owner-authorized full MLG-ULB credit-card fraud benchmark distributed through Kaggle",
+    "license": "Source access and reuse terms accepted by the owner; this repository does not grant redistribution rights",
+    "classification": "private",
+    "permittedUse": "Owner-authorized local training and public demonstration through anonymized scored outputs",
+    "includedFields": [
+      "Time as elapsed seconds",
+      "Amount as source transaction amount",
+      "V1 through V28 anonymized transformed features",
+      "Class as a retrospective evaluation label only"
+    ],
+    "excludedFields": [
+      "card or account identity",
+      "customer or merchant identity",
+      "channel and geography",
+      "analyst disposition and intervention outcome",
+      "calendar event timestamp"
+    ],
+    "deployedArtifactContents": [
+      "Selected trained model and complete 56,962-row scored holdout in private read-only Cloud Storage",
+      "Public queue output containing source row ID, elapsed time, amount, calibrated score, observed outcome, and rank",
+      "Public record output containing the same anonymized facts plus three strongest model signals",
+      "No raw creditcard.csv and no cardholder, account, customer, or merchant identity"
+    ]
+  },
+  "evidence": [
+    {
+      "id": "data.boundary",
+      "kind": "disclosure",
+      "claim": "All 284,807 source rows validate with 492 fraud labels, 31 columns, and no missing values; the raw CSV remains outside Git and Cloud Run.",
+      "source": "evaluation/summary.json and README.md",
+      "method": "Full schema validation before chronological partitioning",
+      "result": 284807,
+      "scope": "Owner-authorized private benchmark",
+      "execution": "deterministic",
+      "caveat": "The source contains no operational identity fields."
+    },
+    {
+      "id": "model.selection",
+      "kind": "evaluation",
+      "claim": "The logistic baseline shipped because XGBoost improved calibration PR-AUC by 0.0064, below the predeclared 0.02 complexity gate.",
+      "source": "evaluation/report.md",
+      "method": "Chronological calibration model-selection gate",
+      "result": "logistic_regression",
+      "execution": "deterministic",
+      "caveat": "The stronger XGBoost test result remained diagnostic and did not reverse selection."
+    },
+    {
+      "id": "evaluation.heldout",
+      "kind": "evaluation",
+      "claim": "The selected logistic model reached 0.7744 PR-AUC on the 56,962-row untouched test partition, with a 95% bootstrap interval from 0.6704 to 0.8501.",
+      "source": "evaluation/report.md",
+      "method": "One chronological holdout and 300 deterministic bootstrap resamples",
+      "result": 0.7744,
+      "execution": "deterministic",
+      "caveat": "Only 75 fraud rows occur in the test partition."
+    },
+    {
+      "id": "policy.default",
+      "kind": "evaluation",
+      "claim": "At one review per 1,000 transactions, the queue reviews 56 rows, captures 51 of 75 observed frauds, and records 91.1% precision and 68.0% recall.",
+      "source": "evaluation/report.md",
+      "method": "Calibration-selected threshold plus deterministic held-out capacity ranking",
+      "result": 0.68,
+      "execution": "deterministic",
+      "caveat": "Observed labels are retrospective outcomes, not analyst dispositions."
+    },
+    {
+      "id": "policy.frontier",
+      "kind": "evaluation",
+      "claim": "The smallest score-ranked queue reaching 80% observed recall contains 120 reviews; reaching 90% requires 2,430.",
+      "source": "evaluation/report.md",
+      "method": "Post-hoc cumulative ranking of the same immutable holdout",
+      "result": 120,
+      "execution": "deterministic",
+      "caveat": "Scenarios are diagnostic and cannot serve as deployment thresholds without new validation and operating-cost inputs."
+    },
+    {
+      "id": "delivery.tests",
+      "kind": "test",
+      "claim": "Twenty-two hermetic tests cover data, artifacts, policy, APIs, failure states, request limiting, and release verification.",
+      "source": "tests/ and .github/workflows/ci.yml",
+      "method": "pytest in local and GitHub Actions environments",
+      "result": 22,
+      "execution": "deterministic",
+      "counts": {
+        "total": 22,
+        "passed": 22,
+        "failed": 0
+      }
+    },
+    {
+      "id": "deployment.live",
+      "kind": "deployment",
+      "claim": "The anonymous Cloud Run service reports ready health and renders the full decision workflow from the active real artifact run.",
+      "source": "https://fraud-decision-workbench-lfpwcuk37a-uc.a.run.app/health",
+      "method": "Anonymous HTTP plus desktop and 390-pixel live-browser acceptance",
+      "result": true,
+      "observedAt": "2026-09-01T01:25:45Z",
+      "environment": "Google Cloud Run us-central1",
+      "execution": "live",
+      "caveat": "This is a cost-bounded portfolio demonstration, not a production service objective."
+    },
+    {
+      "id": "deployment.cost-bound",
+      "kind": "security",
+      "claim": "The public service permits one instance, scales to zero, and rejects excess sustained request work with HTTP 429.",
+      "source": "docs/decisions/0009-bound-public-request-work.md",
+      "method": "Cloud Run configuration inspection and concurrent anonymous HTTP burst",
+      "result": true,
+      "observedAt": "2026-09-01T01:25:45Z",
+      "environment": "Google Cloud Run us-central1",
+      "execution": "live",
+      "caveat": "The in-process request bucket is neither distributed nor identity-aware."
+    }
+  ],
+  "story": {
+    "recruiterSummary": "A full-data payments-fraud strategy product that turns rare-event model evidence into an explicit staffing decision instead of stopping at a score.",
+    "technicalNarrative": "The pipeline validates every source row, preserves chronology, selects complexity on calibration evidence, evaluates once on an untouched period, and writes one immutable run. The workbench converts that run into threshold and capacity consequences, a deterministic queue, a capacity frontier, and anonymized record evidence.",
+    "scalabilityRoadmap": [
+      "Add authenticated analyst access before using protected operational data",
+      "Add durable distributed request controls before permitting multiple instances",
+      "Add scheduled retraining and model-freshness monitoring only after a live label source exists",
+      "Add customer, merchant, channel, analyst-cost, and intervention outcomes before making operating or fairness claims"
+    ],
+    "executiveSummary": "At the current review budget, 56 reviews capture 51 of 75 observed frauds with five non-fraud reviews. The next useful step is not simply more model complexity: moving to 80% observed recall needs 120 reviews, while 90% needs 2,430. The product makes that workload curve visible before a strategy owner changes policy.",
+    "intendedUser": "A fraud operations lead comparing score thresholds and review capacity, supported by an analyst inspecting the bounded queue.",
+    "example": {
+      "title": "Deciding whether to fund an extended review tier",
+      "steps": [
+        "Read the current operating point: 56 reviews, 68.0% recall, 91.1% precision",
+        "Select the 80% retrospective scenario and see the queue rise to 120 reviews at 50.0% precision",
+        "Compare the 85% and 90% points to locate the saturation zone",
+        "Inspect captured and non-fraud queue records with anonymized model signals",
+        "Take the measured workload trade-off into staffing and policy review without treating it as a production threshold"
+      ]
+    },
+    "technologyDecisions": [
+      {
+        "technology": "Class-weighted logistic regression with Platt calibration",
+        "rationale": "The challenger missed the predeclared calibration lift needed to justify extra complexity, while the baseline produced calibrated probabilities for threshold analysis.",
+        "alternative": "Promote XGBoost because its held-out test PR-AUC was higher",
+        "tradeoff": "The simpler model gives up diagnostic test lift to preserve a selection rule fixed before test evaluation."
+      },
+      {
+        "technology": "One immutable artifact run",
+        "rationale": "Model, evaluation, partition report, and scored holdout remain tied to one validated run ID, so every dashboard number resolves to the same evidence.",
+        "alternative": "Recompute policies from multiple stores or retrain during serving",
+        "tradeoff": "Training stays owner-operated and freshness is manual until a real label source and cadence exist."
+      },
+      {
+        "technology": "Dash and Flask in one process",
+        "rationale": "One read-only process serves policy controls, APIs, charts, queue filtering, and drill-down without introducing infrastructure unsupported by the data.",
+        "alternative": "Kafka, Spark, Redis, SQL, CDC, and separate API and frontend services",
+        "tradeoff": "The compact topology does not simulate streaming or multi-service production behavior."
+      },
+      {
+        "technology": "Scale-to-zero Cloud Run with private Cloud Storage artifacts",
+        "rationale": "The complete real artifact run can remain private while the decision surface stays publicly reachable at bounded cost.",
+        "alternative": "Always-on compute, a public artifact bucket, or a generated substitute dataset",
+        "tradeoff": "Cold starts remain possible, and the one-process request limiter cannot support a multi-instance production service."
+      }
+    ],
+    "evidence": [
+      {
+        "value": "68.0%",
+        "label": "Fraud recall at one review per 1,000",
+        "context": "51 of 75 observed frauds captured in a 56-row queue",
+        "method": "Calibration-selected threshold and deterministic chronological holdout ranking",
+        "meaning": "The default queue captures over two-thirds of observed fraud while reviewing 0.098% of holdout rows.",
+        "threshold": "At least 60% recall",
+        "evidenceRefs": [
+          "policy.default"
+        ]
+      },
+      {
+        "value": "91.1%",
+        "label": "Retrospective queue precision",
+        "context": "Five of 56 reviewed rows are observed non-fraud",
+        "method": "Observed outcomes inside the same bounded queue",
+        "meaning": "Most default-policy review work is useful within this retrospective benchmark.",
+        "threshold": "At least 60% precision",
+        "evidenceRefs": [
+          "policy.default"
+        ]
+      },
+      {
+        "value": "0.7744",
+        "label": "Held-out PR-AUC",
+        "context": "95% bootstrap interval from 0.6704 to 0.8501 on 56,962 test rows",
+        "method": "Untouched chronological test period and 300 deterministic bootstrap resamples",
+        "meaning": "The selected model ranks rare fraud outcomes materially above the holdout base rate, with uncertainty made explicit.",
+        "evidenceRefs": [
+          "evaluation.heldout"
+        ]
+      },
+      {
+        "value": "120",
+        "label": "Minimum reviews for 80% observed recall",
+        "context": "64 more reviews than the default queue for nine additional fraud captures",
+        "method": "Post-hoc cumulative ranking of the immutable holdout",
+        "meaning": "An extended tier remains compact at 80%, but the workload curve degrades sharply beyond it.",
+        "evidenceRefs": [
+          "policy.frontier"
+        ]
+      }
+    ],
+    "limitations": [
+      "The benchmark is static, anonymized, and spans roughly two elapsed days without calendar timestamps.",
+      "Only 57 fraud rows occur in calibration and 75 in test, so sampling uncertainty is material.",
+      "No card, customer, merchant, channel, geography, analyst disposition, intervention outcome, or live feedback exists.",
+      "Source amount is not realized fraud loss or loss avoided.",
+      "The public service is a bounded demonstration and does not establish production availability, latency, throughput, or security."
+    ]
+  },
+  "resume": {
+    "bulletCandidates": [
+      {
+        "role": "Data Scientist",
+        "bullet": "Selected a calibrated logistic fraud model over XGBoost after the challenger missed a predeclared 0.02 calibration PR-AUC lift gate, then measured 0.7744 PR-AUC on an untouched chronological holdout.",
+        "evidenceRefs": [
+          "model.selection",
+          "evaluation.heldout"
+        ]
+      },
+      {
+        "role": "Fraud Strategy Analyst",
+        "bullet": "Converted 284,807 payment records into a capacity-bounded review policy that captured 51 of 75 observed frauds at 91.1% precision, and quantified the queue expansion from 120 reviews at 80% recall to 2,430 at 90%.",
+        "evidenceRefs": [
+          "data.boundary",
+          "policy.default",
+          "policy.frontier"
+        ]
+      },
+      {
+        "role": "Data Engineer",
+        "bullet": "Built a replayable model-artifact contract and deployed the complete scored holdout through a scale-to-zero Cloud Run service with private read-only storage, one maximum instance, and bounded anonymous request work.",
+        "evidenceRefs": [
+          "delivery.tests",
+          "deployment.live",
+          "deployment.cost-bound"
+        ]
+      }
+    ]
+  }
+}

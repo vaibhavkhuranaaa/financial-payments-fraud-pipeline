@@ -14,9 +14,9 @@
 - Live transaction streaming and automatic payment decisions.
 - Fabricated card, customer, merchant, channel, location, or feedback fields.
 - Operational loss avoided, reviewer handling time, fairness, drift, throughput, latency, or uptime claims.
-- Raw dataset or row-level artifact redistribution.
-- Paid cloud resources, deployment, push, publication, merge, history rewrite, or portfolio mutation without a separate owner gate.
+- Raw dataset or trained artifact-file redistribution.
+- External state changes without a separate owner gate, including paid resources, deployment, publication, history rewrite, and portfolio mutation.
 
 ## Completion boundary
 
-Local P0 through P6 delivery is complete when repository checks, full-data replay, browser behavior, evidence records, decisions, and internal delivery checks pass. The project remains `building` at that boundary because deployment, scale evidence, publication, and portfolio work require explicit external approvals.
+Delivery is complete only when repository checks, full-data replay, browser behavior, evidence records, deployment, bounded scale evidence, publication, and portfolio verification pass their recorded gates.

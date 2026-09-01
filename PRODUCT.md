@@ -18,7 +18,7 @@ The workbench binds model evaluation to analyst capacity. It exposes both contro
 
 ## Operating Context
 
-The product runs locally from the full git-ignored dataset and real artifact directory. Training is chronological. The console reads the versioned scored holdout produced by that run, not a substitute dataset or live transaction stream.
+Training runs locally from the full git-ignored dataset. Local and hosted consoles read the same immutable scored holdout produced by that chronological run, not a substitute dataset or live transaction stream. The hosted container mounts the active artifact run read-only from private object storage.
 
 ## Capabilities and Constraints
 

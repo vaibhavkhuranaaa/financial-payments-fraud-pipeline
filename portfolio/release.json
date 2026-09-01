@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "status": "enabled",
+  "provider": "Google Cloud Run",
+  "workflow": "manual-cloud-run-release",
+  "deploymentTarget": "fraud-decision-workbench",
+  "publicProject": true,
+  "verification": {
+    "url": "https://fraud-decision-workbench-lfpwcuk37a-uc.a.run.app/api/release",
+    "sourceShaField": "source_sha"
+  },
+  "paidResource": true,
+  "costApprovalRequired": true
+}

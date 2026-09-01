@@ -22,6 +22,7 @@ The public Cloud Run service mounts the complete active run from private object 
 | Interface | Purpose |
 | --- | --- |
 | `GET /health` | Artifact readiness |
+| `GET /api/release` | Deployed source revision for portfolio verification |
 | `GET /api/metrics` | Aggregate run evaluation |
 | `GET /api/summary` | Policy consequences for threshold and capacity |
 | `GET /api/queue` | Bounded ranked transactions |
@@ -38,6 +39,7 @@ The public Cloud Run service mounts the complete active run from private object 
 - Filters with no matching queue records produce a distinct empty state.
 - Invalid score payloads return HTTP 400 with contract diagnostics.
 - A process-wide token bucket returns HTTP 429 when the configured public request ceiling is exhausted.
+- A missing or malformed deployed source revision makes the release endpoint return HTTP 503.
 
 ## Public demonstration boundary
 
