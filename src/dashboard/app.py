@@ -323,7 +323,7 @@ def _layout(store: ArtifactStore) -> html.Div:
                                         if model
                                         else "Unavailable",
                                         (
-                                            f"95% bootstrap {model['pr_auc_ci_95']['low']:.3f}–"
+                                            f"95% bootstrap {model['pr_auc_ci_95']['low']:.3f}-"
                                             f"{model['pr_auc_ci_95']['high']:.3f}"
                                             if model
                                             else "No model evidence"

@@ -9,6 +9,14 @@ An evidence-backed fraud review product built on the full MLG-ULB `creditcard.cs
 
 The product uses the full 284,807-row benchmark and its real trained run artifacts. It does not generate a substitute product dataset. The [public decision workbench](https://fraud-decision-workbench-lfpwcuk37a-uc.a.run.app) serves the complete scored holdout from a cost-bounded Cloud Run service.
 
+| Held-out result | Baseline | Release gate | Result |
+| --- | ---: | ---: | ---: |
+| PR-AUC | 0.13% prevalence | above baseline | 0.7744 |
+| Precision at 1 review per 1,000 | 0.13% prevalence | at least 60% | 91.1% |
+| Recall at 1 review per 1,000 | 0% with no reviews | at least 60% | 68.0% |
+
+![Fraud strategy workbench showing policy consequences, capacity frontier, scenarios, diagnostics, and bounded queue](docs/assets/fraud-strategy-workbench.png)
+
 ## What it does
 
 - Validates all 284,807 private source rows and preserves valid duplicates.
