@@ -33,6 +33,7 @@ from src.dashboard.data import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ARTIFACT_ROOT = REPO_ROOT / "artifacts"
+THRESHOLD_STEP = 0.000001
 
 
 class _TokenBucket:
@@ -103,7 +104,9 @@ def build_score_figure(frame: pd.DataFrame, threshold: float) -> go.Figure:
         yaxis=dict(
             title="Transactions, log scale",
             type="log",
+            dtick=1,
             gridcolor="#e3e1da",
+            tickfont=dict(size=11),
             zeroline=False,
         ),
         hoverlabel=dict(bgcolor="#171915", font_color="#fffdf8"),
@@ -399,7 +402,7 @@ def _layout(store: ArtifactStore) -> html.Div:
                                         id="threshold-slider",
                                         min=0,
                                         max=1,
-                                        step=0.005,
+                                        step=THRESHOLD_STEP,
                                         value=store.default_threshold,
                                         marks={
                                             0: "0",
@@ -450,6 +453,8 @@ def _layout(store: ArtifactStore) -> html.Div:
                                         "Policy unavailable",
                                         id="policy-status",
                                         className="policy-status",
+                                        role="status",
+                                        **{"aria-live": "polite"},
                                     ),
                                 ],
                                 className="policy-controls",
@@ -578,20 +583,30 @@ def _layout(store: ArtifactStore) -> html.Div:
                                         ],
                                         className="section-heading",
                                     ),
-                                    dcc.Graph(
-                                        id="capacity-frontier",
-                                        figure=(
-                                            build_frontier_figure(
-                                                store.frontier, current
-                                            )
-                                            if store.ready
-                                            else _empty_figure(error)
+                                    html.Div(
+                                        dcc.Graph(
+                                            id="capacity-frontier",
+                                            figure=(
+                                                build_frontier_figure(
+                                                    store.frontier, current
+                                                )
+                                                if store.ready
+                                                else _empty_figure(error)
+                                            ),
+                                            config={
+                                                "displayModeBar": False,
+                                                "responsive": True,
+                                            },
+                                            className="graph-shell frontier-graph",
                                         ),
-                                        config={
-                                            "displayModeBar": False,
-                                            "responsive": True,
+                                        id="capacity-frontier-region",
+                                        role="img",
+                                        **{
+                                            "aria-label": (
+                                                "Line chart of retrospective fraud recall against review capacity per 1,000 transactions. "
+                                                "The current policy appears as a diamond; exact current values are stated above."
+                                            )
                                         },
-                                        className="graph-shell frontier-graph",
                                     ),
                                 ],
                                 className="frontier-panel",
@@ -655,20 +670,31 @@ def _layout(store: ArtifactStore) -> html.Div:
                                     html.P(
                                         "Observed outcomes appear only because this is a retrospective holdout."
                                     ),
-                                    dcc.Graph(
-                                        id="score-distribution",
-                                        figure=(
-                                            build_score_figure(
-                                                store.scored, store.default_threshold
-                                            )
-                                            if store.ready
-                                            else _empty_figure(error)
+                                    html.Div(
+                                        dcc.Graph(
+                                            id="score-distribution",
+                                            figure=(
+                                                build_score_figure(
+                                                    store.scored,
+                                                    store.default_threshold,
+                                                )
+                                                if store.ready
+                                                else _empty_figure(error)
+                                            ),
+                                            config={
+                                                "displayModeBar": False,
+                                                "responsive": True,
+                                            },
+                                            className="graph-shell diagnostic-graph",
                                         ),
-                                        config={
-                                            "displayModeBar": False,
-                                            "responsive": True,
+                                        id="score-distribution-region",
+                                        role="img",
+                                        **{
+                                            "aria-label": (
+                                                "Overlaid logarithmic histograms compare calibrated scores for observed fraud and non-fraud transactions. "
+                                                "A dashed line marks the selected threshold; exact policy consequences are stated above."
+                                            )
                                         },
-                                        className="graph-shell diagnostic-graph",
                                     ),
                                 ],
                                 className="diagnostic-content",

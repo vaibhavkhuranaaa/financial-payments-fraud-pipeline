@@ -4,6 +4,23 @@ from src.dashboard.app import _brief_copy, create_app
 from src.fraud_workbench.data import FEATURE_COLUMNS
 
 
+def _component_props(node, component_id: str):
+    if isinstance(node, dict):
+        props = node.get("props", {})
+        if props.get("id") == component_id:
+            return props
+        for value in node.values():
+            match = _component_props(value, component_id)
+            if match is not None:
+                return match
+    elif isinstance(node, list):
+        for value in node:
+            match = _component_props(value, component_id)
+            if match is not None:
+                return match
+    return None
+
+
 def test_health_summary_queue_and_record_routes(artifact_root) -> None:
     app = create_app(artifact_root)
     client = app.server.test_client()
@@ -91,6 +108,21 @@ def test_dashboard_shell_contains_policy_and_recovery_states(artifact_root) -> N
     page = app.server.test_client().get("/").get_data(as_text=True)
     assert "Fraud Decision Workbench" in page
     assert "_dash-layout" in page or "dash-renderer" in page
+
+
+def test_dashboard_controls_and_charts_expose_exact_accessible_contract(
+    artifact_root,
+) -> None:
+    app = create_app(artifact_root)
+    layout = app.server.test_client().get("/_dash-layout").get_json()
+
+    threshold = _component_props(layout, "threshold-slider")
+    frontier = _component_props(layout, "capacity-frontier-region")
+    distribution = _component_props(layout, "score-distribution-region")
+
+    assert threshold["step"] == 0.000001
+    assert frontier["role"] == "img" and frontier["aria-label"]
+    assert distribution["role"] == "img" and distribution["aria-label"]
 
 
 def test_director_brief_tracks_active_policy() -> None:
